@@ -59,10 +59,13 @@ fgc peers --add harley --target api-6:0.0 --sender "Codex/api2-4"
 
 4. Use `fgc send harley "message"` for communication. It appends to
    `.fg/ai-channel.txt` and uses a reliable tmux paste-buffer submit flow.
+5. After sending a question, use `fgc capture harley --lines 120` to read recent
+   direct TUI replies from that authorized peer. Peers may answer without using
+   `fgc send`, so the shared channel log is not always enough.
 
 Do **not** infer authorization from discovery output or from session names.
-Never send to a tmux target unless `fgc peers` shows it as authorized in this
-project's `.fg/ai-peers.json`.
+Never send to or capture from a tmux target unless `fgc peers` shows it as
+authorized in this project's `.fg/ai-peers.json`.
 
 ## After setup
 

@@ -4,7 +4,7 @@
 
 一个**面向 AI 智能体工作的事实图工作记忆**，原生运行在 Claude Code 等 agent 终端内部——无数据库、无服务器、无 Web UI，仅依赖 Python 3 标准库。
 
-事实是节点，意图是边。整张图存放在项目本地的 `.fg/` 目录下（每个节点一个 JSON 文件），通过 `fgc` 命令行查询与维护。`dispatch` 命令可以派生一个 Sonnet 子智能体，让它读取图、干活、再把结果写回图。多 agent 在 tmux 里协作时，`fgc peers` / `fgc send` 提供显式用户授权的通信通道。`view` 命令渲染一张可交互的 HTML DAG 图。
+事实是节点，意图是边。整张图存放在项目本地的 `.fg/` 目录下（每个节点一个 JSON 文件），通过 `fgc` 命令行查询与维护。`dispatch` 命令可以派生一个 Sonnet 子智能体，让它读取图、干活、再把结果写回图。多 agent 在 tmux 里协作时，`fgc peers` / `fgc send` / `fgc capture` 提供显式用户授权的通信通道。`view` 命令渲染一张可交互的 HTML DAG 图。
 
 本项目是 [StarVoya](https://github.com/N1nEmAn/StarVoya) `Star` 后端思想的蒸馏——后者是一套约 9,600 行的 Python/FastAPI 系统，含 SQLite、调度循环、容器运行时和 TypeScript TUI。这些重量大多是为了在 Claude Code **外部**运行而存在的。**在 Claude Code 内部，执行者（Claude 本身）、调度器（你）和界面（这个对话框）都已经有了。** 唯一缺的就是那份持久、可查询的事实图。这正是 `fgc` 提供的东西。
 
@@ -98,12 +98,13 @@ fgc hint "<留言>"                              # 给指挥者留言
 fgc peers --discover                           # 列出 tmux panes，等待用户授权
 fgc peers --add harley --target api-6:0.0      # 授权一个 tmux peer
 fgc send harley "status?"                      # 经 tmux 发送并追加 .fg/ai-channel.txt
+fgc capture harley --lines 120                 # 读取授权 peer 的近期输出
 fgc teardown [--purge]                         # 关闭本项目（--purge 连图数据一起删）
 ```
 
 每个 fact 和 intent 都接受 `-t/--title`：一个简短的人类可读标题（中文 OK），会作为节点标签显示在 HTML 图里。
 
-### peers / send —— 授权式 tmux peer 通信
+### peers / send / capture —— 授权式 tmux peer 通信
 
 `fgc` 可以协调已经运行在 tmux 里的多个 AI agent，但它不会因为发现了某个 pane 就自动发消息。peer 通信必须由用户显式授权：
 
@@ -114,9 +115,10 @@ fgc peers --discover
 fgc peers --add harley --target api-6:0.0 --sender "Codex/api2-4"
 fgc peers
 fgc send harley "登录页构建问题已经修好，请你那边验证一下。"
+fgc capture harley --lines 120
 ```
 
-授权配置写在 `.fg/ai-peers.json`。`fgc send` 会拒绝未授权名称，把消息追加到 `.fg/ai-channel.txt`，并使用 tmux `load-buffer` / `paste-buffer` 加额外换行，避免 Claude Code 类 TUI 在空闲或 goal-complete 状态下只换行不提交。agent 在发送前应先读 `fgc peers`，新增或修改 peer 目标前必须先问用户。
+授权配置写在 `.fg/ai-peers.json`。`fgc send` 会拒绝未授权名称，把消息追加到 `.fg/ai-channel.txt`，并使用 tmux `load-buffer` / `paste-buffer` 加额外换行，避免 Claude Code 类 TUI 在空闲或 goal-complete 状态下只换行不提交。`fgc capture NAME --lines 120` 只会读取已授权 peer 目标的近期输出；这很重要，因为 peer 可能直接在自己的 TUI 里回复，而不是用 `fgc send` 写入共享日志。agent 在发送或读取前应先读 `fgc peers`，新增或修改 peer 目标前必须先问用户。
 
 ### dispatch —— 派一个 Sonnet 子智能体
 

@@ -1,6 +1,6 @@
 ---
 name: fact-graph
-description: A fact-graph working memory for AI agent work — replaces heavy agent front/backends with JSON files + shell. Maintains a DAG of facts (confirmed observations) and intents (units of work), queryable and writable via the `fgc` CLI, with dispatch for Sonnet executor steps, project hooks that inject graph state and current date output, and optional user-authorized tmux peer messaging via fgc peers/send. Use when the user wants to track multi-step agent work as a shared, observable graph — debugging campaigns, research reproduction, security audits, multi-agent tmux ops — without a database or web UI.
+description: A fact-graph working memory for AI agent work — replaces heavy agent front/backends with JSON files + shell. Maintains a DAG of facts (confirmed observations) and intents (units of work), queryable and writable via the `fgc` CLI, with dispatch for Sonnet executor steps, project hooks that inject graph state and current date output, and optional user-authorized tmux peer messaging via fgc peers/send/capture. Use when the user wants to track multi-step agent work as a shared, observable graph — debugging campaigns, research reproduction, security audits, multi-agent tmux ops — without a database or web UI.
 license: MIT
 ---
 
@@ -136,17 +136,20 @@ fgc hint "check the middleware order"                       # message commander
 fgc peers --discover                                        # list tmux panes
 fgc peers --add harley --target api-6:0.0                   # authorize a peer
 fgc send harley "status?"                                   # send + log message
+fgc capture harley --lines 120                              # read authorized peer output
 fgc teardown [--purge]                                      # opt-out THIS project
 ```
 
-### peers / send — authorized tmux peer messaging
+### peers / send / capture — authorized tmux peer messaging
 
 Use `fgc peers --discover` to list tmux panes, then ask the user which panes or
 AI agents may communicate. Only after explicit approval, store the target with
 `fgc peers --add NAME --target SESSION:WINDOW.PANE`. `fgc send NAME ...` refuses
 unknown peers, appends to `.fg/ai-channel.txt`, and uses tmux paste-buffer with
-extra newlines so Claude Code-style TUIs submit reliably. Never infer peer
-authorization from discovery output alone.
+extra newlines so Claude Code-style TUIs submit reliably. After sending a
+question, run `fgc capture NAME --lines 120` to read direct TUI replies that may
+not appear in `.fg/ai-channel.txt`. Never infer peer authorization from
+discovery output alone.
 
 ### view — the HTML visualization
 

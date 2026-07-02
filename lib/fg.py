@@ -1753,6 +1753,23 @@ def _paste_tmux(target: str, text: str) -> None:
         raise FGError(f"tmux paste failed for {target}: {exc}")
 
 
+def _capture_tmux(target: str, lines: int) -> str:
+    try:
+        proc = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-J", "-t", target, "-S", f"-{lines}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        raise FGError("tmux not found on PATH")
+    except subprocess.TimeoutExpired:
+        raise FGError(f"tmux capture timed out for {target}")
+    if proc.returncode != 0:
+        raise FGError(proc.stderr.strip() or f"tmux capture failed for {target}")
+    return proc.stdout.rstrip()
+
+
 def cmd_peers(args) -> int:
     store = Store(Path(args.store))
     store.require()
@@ -1874,6 +1891,39 @@ def cmd_send(args) -> int:
     return 0
 
 
+def cmd_capture(args) -> int:
+    store = Store(Path(args.store))
+    store.require()
+    data = _load_peers(store)
+    peer = data["peers"].get(args.peer)
+    if peer is None:
+        raise FGError(
+            f"peer not configured: {args.peer}. Run `fgc peers` to see authorized peers."
+        )
+    target = peer.get("target")
+    if not target:
+        raise FGError(f"peer {args.peer} has no tmux target")
+    if not _tmux_target_exists(target):
+        raise FGError(f"tmux target not found: {target}")
+    if args.lines < 1 or args.lines > 2000:
+        raise FGError("--lines must be between 1 and 2000")
+
+    text = _capture_tmux(target, args.lines)
+    print(text)
+
+    if args.log:
+        channel = Path(args.channel or data.get("channel") or (store.root / AI_CHANNEL_NAME))
+        channel.parent.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M")
+        with open(channel, "a", encoding="utf-8") as fh:
+            fh.write(
+                f"[{stamp}][fgc-capture] peer={args.peer} "
+                f"target={target} lines={args.lines}\n"
+            )
+            fh.write(text + "\n")
+    return 0
+
+
 _AGENTS_SPEC = """\
 # AGENTS.md — fact-graph protocol
 
@@ -1899,6 +1949,7 @@ fgc hint "<message>"           # leave a note for the commander / human
 fgc peers --discover           # list tmux panes before asking the user to authorize peers
 fgc peers                      # list user-authorized peer targets from .fg/ai-peers.json
 fgc send <peer> "<message>"    # message an authorized peer via tmux + append .fg/ai-channel.txt
+fgc capture <peer>             # read recent output from an authorized peer pane
 ```
 
 ## three documentation layers (every node)
@@ -1918,6 +1969,9 @@ fgc send <peer> "<message>"    # message an authorized peer via tmux + append .f
    and it is listed by `fgc peers` in `{store}/ai-peers.json`.
 7. For authorized peer communication, prefer `fgc send <peer> ...`; it uses the
    reliable paste-buffer newline flow and records the message in the shared log.
+8. After sending a question, proactively check for replies with
+   `fgc capture <peer> --lines 120`; peers may answer directly in their TUI, so
+   not every reply appears in ai-channel.txt.
 """
 
 
@@ -2026,6 +2080,24 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-log", action="store_true", help="do not append to the shared log")
     sp.add_argument("--raw", action="store_true", help="send body without timestamp/sender prefix")
     sp.set_defaults(func=cmd_send)
+
+    sp = sub.add_parser(
+        "capture",
+        help="read recent output from a user-authorized tmux peer",
+        description=(
+            "Capture recent pane output from a peer configured by `fgc peers --add`. "
+            "Use this after sending questions because peers may reply directly in "
+            "their TUI instead of using fgc send."
+        ),
+    )
+    sp.add_argument("peer", help="authorized peer name")
+    sp.add_argument("--lines", type=int, default=120,
+                    help="recent pane lines to capture (1-2000)")
+    sp.add_argument("--channel", default=None,
+                    help="override shared log path when --log is used")
+    sp.add_argument("--log", action="store_true",
+                    help="append captured output to the shared log")
+    sp.set_defaults(func=cmd_capture)
 
     sp = sub.add_parser("show", help="show project | fact <id> | intent <id>")
     sp.add_argument("entity", choices=["project", "fact", "intent"])
