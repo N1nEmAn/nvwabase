@@ -1171,6 +1171,8 @@ def cmd_dispatch(args) -> int:
         return _dispatch_reason(store, templates_dir, model, timeout, skip, cwd, args)
     elif args.target == "verify":
         return _dispatch_verify(store, templates_dir, model, timeout, skip, cwd, args)
+    elif args.target == "blindspot":
+        return _dispatch_blindspot(store, templates_dir, model, timeout, skip, cwd, args)
     else:
         # treat as intent id -> explore
         intent = store.get_intent(args.target)
@@ -1295,6 +1297,52 @@ def _dispatch_verify(store, templates_dir, model, timeout, skip, cwd, args) -> i
     tag = "VERIFIED" if verified else "FAILED"
     print(f"[verify] {args.intent}: {tag}" + (f" — {issues}" if issues else ""))
     return 0
+
+
+def _dispatch_blindspot(store, templates_dir, model, timeout, skip, cwd, args) -> int:
+    tpl = _load_template(templates_dir, "blindspot.md")
+    prompt = render_prompt(store, tpl)
+    if args.dry_run:
+        print(prompt)
+        return 0
+    envelope = run_claude(
+        prompt,
+        model=model, timeout=timeout, skip_permissions=skip,
+        append_system=None, cwd=cwd,
+    )
+    text = envelope.get("result", "")
+    payload = extract_json_object(text)
+    summary = _apply_blindspot(store, payload)
+    print(f"[blindspot] {summary}")
+    return 0
+
+
+def _apply_blindspot(store: Store, payload: dict) -> str:
+    """Parse blindspot output and record each as a hint."""
+    if payload.get("accepted") is False:
+        return "blindspot analysis rejected"
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        raise FGError(f"invalid blindspot payload: {payload}")
+    spots = data.get("blindspots", [])
+    if not isinstance(spots, list):
+        raise FGError("blindspots must be a list")
+    if not spots:
+        return "no blindspots identified"
+    recorded = []
+    for spot in spots:
+        if not isinstance(spot, dict):
+            continue
+        area = spot.get("area", "unknown")
+        risk = spot.get("risk", "medium")
+        question = spot.get("question", "")
+        suggestion = spot.get("suggestion", "")
+        content = f"[blindspot/{risk}] {area}: {question}"
+        if suggestion:
+            content += f" — suggestion: {suggestion}"
+        store.add_hint(content=content, creator="blindspot")
+        recorded.append(area)
+    return f"identified {len(recorded)} blindspot(s): {', '.join(recorded)}"
 
 
 def _load_template(templates_dir: Path, name: str) -> str:
