@@ -1173,6 +1173,8 @@ def cmd_dispatch(args) -> int:
         return _dispatch_verify(store, templates_dir, model, timeout, skip, cwd, args)
     elif args.target == "blindspot":
         return _dispatch_blindspot(store, templates_dir, model, timeout, skip, cwd, args)
+    elif args.target == "brainstorm":
+        return _dispatch_brainstorm(store, templates_dir, model, timeout, skip, cwd, args)
     else:
         # treat as intent id -> explore
         intent = store.get_intent(args.target)
@@ -1343,6 +1345,113 @@ def _apply_blindspot(store: Store, payload: dict) -> str:
         store.add_hint(content=content, creator="blindspot")
         recorded.append(area)
     return f"identified {len(recorded)} blindspot(s): {', '.join(recorded)}"
+
+
+def _dispatch_brainstorm(store, templates_dir, model, timeout, skip, cwd, args) -> int:
+    tpl = _load_template(templates_dir, "brainstorm.md")
+    prompt = render_prompt(store, tpl)
+    max_options = str(getattr(args, "max_options", 4))
+    prompt = prompt.replace("{max_options}", max_options)
+    if args.dry_run:
+        print(prompt)
+        return 0
+    envelope = run_claude(
+        prompt,
+        model=model, timeout=timeout, skip_permissions=skip,
+        append_system=None, cwd=cwd,
+    )
+    text = envelope.get("result", "")
+    payload = extract_json_object(text)
+    summary = _apply_brainstorm(store, payload)
+    print(f"[brainstorm] {summary}")
+    return 0
+
+
+def _apply_brainstorm(store: Store, payload: dict) -> str:
+    """Parse brainstorm output: create requires_confirmation intents for each option."""
+    if payload.get("accepted") is False:
+        return "brainstorm rejected"
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        raise FGError(f"invalid brainstorm payload: {payload}")
+    options = data.get("options", [])
+    if not isinstance(options, list):
+        raise FGError("options must be a list")
+    if not options:
+        return "no options generated"
+    batch_tag = f"brainstorm-{now_iso()}"
+    existing_facts = {f["id"] for f in store.list_facts()}
+    made = []
+    for opt in options:
+        if not isinstance(opt, dict):
+            continue
+        from_ids = [str(x) for x in opt.get("from", [])]
+        if not from_ids:
+            continue
+        bad = [x for x in from_ids if x not in existing_facts or x == GOAL_ID]
+        if bad:
+            continue
+        desc = opt.get("description", "").strip()
+        if not desc:
+            continue
+        title = opt.get("title")
+        title = title.strip() if isinstance(title, str) and title.strip() else None
+        effort = opt.get("effort", "medium")
+        doc_text = opt.get("doc", "") or ""
+        doc_text = f"[brainstorm batch: {batch_tag}]\n[effort: {effort}]\n\n{doc_text}".strip()
+        intent = store.add_intent(
+            from_ids=from_ids,
+            description=desc,
+            creator="brainstorm",
+            requires_confirmation=True,
+            title=title,
+            doc=doc_text,
+        )
+        made.append(intent["id"])
+    if not made:
+        return "no valid options (check from-facts exist)"
+    return f"proposed {len(made)} options (confirm one with `fgc brainstorm-pick <id>`): {', '.join(made)}"
+
+
+def cmd_brainstorm_pick(args) -> int:
+    """Pick one brainstorm option: confirm it, abandon siblings from same batch."""
+    store = Store(Path(args.store))
+    store.require()
+    picked_id = args.id
+    picked = store.get_intent(picked_id)
+    if picked["to"] is not None:
+        raise FGError(f"{picked_id} already concluded")
+    if not picked["requires_confirmation"]:
+        raise FGError(f"{picked_id} is not a brainstorm option (no confirmation required)")
+    doc = picked.get("doc") or ""
+    batch_tag = None
+    for line in doc.split("\n"):
+        if line.startswith("[brainstorm batch: "):
+            batch_tag = line.split(": ", 1)[1].rstrip("]")
+            break
+    if not batch_tag:
+        raise FGError(f"{picked_id} has no brainstorm batch tag in its doc")
+    if not picked["confirmed_at"]:
+        store.confirm_intent(picked_id)
+    all_intents = store.list_intents()
+    abandoned = []
+    for i in all_intents:
+        if i["id"] == picked_id:
+            continue
+        if i["to"] is not None:
+            continue
+        i_doc = i.get("doc") or ""
+        if f"[brainstorm batch: {batch_tag}]" in i_doc:
+            fact = store.add_fact(
+                description=f"option abandoned in favor of {picked_id}",
+                creator="brainstorm-pick",
+                source_intent=None,
+                title="已弃用",
+            )
+            store.conclude_intent(i["id"], fact["id"], "brainstorm-pick")
+            abandoned.append(i["id"])
+    print(f"confirmed {picked_id}, abandoned {len(abandoned)} sibling(s): {', '.join(abandoned) or '(none)'}")
+    return 0
 
 
 def _load_template(templates_dir: Path, name: str) -> str:
@@ -2444,7 +2553,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dry-run", action="store_true", help="print the rendered prompt and exit")
     sp.add_argument("--claim", action="store_true", help="(explore) claim the intent first")
     sp.add_argument("--intent", default=None, help="(verify) intent id to verify")
+    sp.add_argument("--max-options", type=int, default=4, help="(brainstorm) number of options to generate")
     sp.set_defaults(func=cmd_dispatch)
+
+    sp = sub.add_parser(
+        "brainstorm-pick",
+        help="pick one brainstorm option, abandon the rest",
+        description=(
+            "After `fgc dispatch brainstorm` proposes multiple options as "
+            "requires_confirmation intents, use this to pick the winner. "
+            "The picked intent is confirmed; siblings from the same batch "
+            "are concluded with a rejection fact."
+        ),
+    )
+    sp.add_argument("id", help="intent id to pick (e.g. i003)")
+    sp.set_defaults(func=cmd_brainstorm_pick)
 
     sp = sub.add_parser(
         "setup",
