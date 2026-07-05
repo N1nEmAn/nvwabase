@@ -1389,6 +1389,17 @@ def _parse_explore_payload(payload: dict) -> tuple[str | None, str, str | None]:
     title = title.strip() if isinstance(title, str) and title.strip() else None
     doc = data.get("doc")
     doc = doc.strip() if isinstance(doc, str) and doc.strip() else None
+    deviations = data.get("deviations")
+    if isinstance(deviations, list) and deviations:
+        lines = ["\n\n## Deviations\n"]
+        for d in deviations:
+            if isinstance(d, dict):
+                planned = d.get("planned", "")
+                actual = d.get("actual", "")
+                reason = d.get("reason", "")
+                lines.append(f"- **Planned:** {planned} → **Actual:** {actual} — *Reason:* {reason}")
+        if len(lines) > 1:
+            doc = (doc or "") + "\n".join(lines)
     return title, desc.strip(), doc
 
 

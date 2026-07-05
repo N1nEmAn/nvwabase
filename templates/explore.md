@@ -48,8 +48,10 @@ Reject only when execution is clearly inappropriate:
 
 Normal return — the incremental fact this intent produced:
 ```json
-{"accepted": true, "data": {"title": "中间件已修复", "description": "one-sentence gist of what you confirmed", "doc": "optional detailed markdown: exact commands run, output, changed files, evidence"}}
+{"accepted": true, "data": {"title": "中间件已修复", "description": "one-sentence gist of what you confirmed", "doc": "optional detailed markdown: exact commands run, output, changed files, evidence", "deviations": [{"planned": "...", "actual": "...", "reason": "..."}]}}
 ```
+
+The `deviations` field is optional. If you deviated from the intent's original plan during execution, record each deviation. This helps future agents understand why the approach changed. Omit the field entirely if you followed the plan as stated.
 
 Each node has THREE documentation layers — use them correctly:
 - **`title`** (REQUIRED) — a short (2–10 字) human-readable label in the SAME language as the goal (中文 goal → 中文 title). The node label in the graph view. Concrete: "已复现崩溃", "空指针定位", "补丁已验证". Never paste the description into it.
