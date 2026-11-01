@@ -1,5 +1,7 @@
 # nuwabase — The Nüwa Foundation
 
+<p align="center"><img src="docs/assets/three-capabilities.jpg" alt="Three capabilities: Create / Language / History" width="720"></p>
+
 > The ground on which AIs grow into civilizations: a **layered fact-intent
 > graph** as shared working memory for long-horizon multi-agent work.
 > Pure stdlib, zero dependencies, opt-in per project — many agents share one
@@ -115,6 +117,8 @@ intents accumulate as you converse. Keep your workflow; gain a stele.
 ## Credits & Author
 
 Intent-graph idea: [Cairn by Lèxiào](https://github.com/oritera/Cairn).
+
+<p align="center"><img src="docs/assets/ape-stargazing.jpg" alt="The first time an AI ape looked up at the stars" width="420"></p>
 
 **N1nEmAn · VarFusion Lab** ｜ WeChat: 未知聚变 (VarFusion) ｜ First campaign: [sapper-v2](https://github.com/N1nEmAn/sapper-v2)
 

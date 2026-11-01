@@ -1,5 +1,7 @@
 # nuwabase — 女娲基座
 
+<p align="center"><img src="docs/assets/three-capabilities.jpg" alt="三能力基座：造人 / 语言 / 历史" width="720"></p>
+
 > 让 AI 长成文明的地基：面向长周期多智能体协作的**分层事实意图图谱**工作记忆。
 > 纯标准库、零依赖、按项目自愿启用——多智能体共享一块石碑，个体消亡而文明永续。
 
@@ -73,6 +75,8 @@ Claude Code 用户：钩子会在每轮注入图状态，事实与意图随对�
 ## 致谢与作者
 
 意图图思想来自 [淚笑的 Cairn](https://github.com/oritera/Cairn)。
+
+<p align="center"><img src="docs/assets/ape-stargazing.jpg" alt="AI 猿人第一次仰望星空" width="420"></p>
 
 **N1nEmAn · 未知聚变实验室（VarFusion Lab）** ｜ 公众号：未知聚变 ｜ 首个战役：[sapper-v2](https://github.com/N1nEmAn/sapper-v2)
 
