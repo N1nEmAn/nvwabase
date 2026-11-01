@@ -1,4 +1,4 @@
-# nuwabase — 女娲基座
+# nvwabase — 女娲基座
 
 <p align="center"><img src="docs/assets/three-capabilities.jpg" alt="三能力基座：造人 / 语言 / 历史" width="720"></p>
 

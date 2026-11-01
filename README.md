@@ -1,4 +1,4 @@
-# nuwabase — The Nüwa Foundation
+# nvwabase — The Nüwa Foundation
 
 <p align="center"><img src="docs/assets/three-capabilities.jpg" alt="Three capabilities: Create / Language / History" width="720"></p>
 
