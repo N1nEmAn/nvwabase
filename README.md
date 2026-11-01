@@ -9,6 +9,8 @@
 
 **English** | [中文](README.zh-CN.md)
 
+📖 **[Full design article (WeChat)](https://mp.weixin.qq.com/s/nibHYWmDTf6TkNhPhtvFdw)**
+
 **First campaign**: [sapper-v2](https://github.com/N1nEmAn/sapper-v2) — the
 autonomous pentest legion iterated on this foundation, champion of the 3rd
 Tencent Cloud Intelligent Attack-Defense Challenge online qualifier

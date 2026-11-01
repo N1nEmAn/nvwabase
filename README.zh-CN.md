@@ -7,6 +7,8 @@
 
 [English](README.md) | **中文**
 
+📖 **[设计原理详解（公众号长文）](https://mp.weixin.qq.com/s/nibHYWmDTf6TkNhPhtvFdw)**
+
 **首个战役验证**：[sapper-v2](https://github.com/N1nEmAn/sapper-v2) —— 基于本基座迭代出的自主渗透军团，第三届腾讯云智能攻防挑战赛线上赛冠军（634 队 · 8 小时无人值守 · 10 亿 token 打出 45 亿 token 的分）。
 
 ---
