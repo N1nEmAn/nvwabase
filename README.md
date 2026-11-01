@@ -54,7 +54,7 @@ History has three layers: **title / summary / evidence document** — read the
 title for the gist, drill down when needed, like using a library. Once
 knowledge is externalized, **individual AI sessions can die while the graph
 survives** — a successor reads the graph and takes over mid-campaign. The
-intent-graph idea is credited to [Cairn by Lèxiào](https://github.com/oritera/Cairn).
+Thanks to [Cairn by Lèxiào](https://github.com/oritera/Cairn) — when we needed to record history for AI agents, their approach was a great reference.
 
 **Why not give AIs more rules?** Today's models are already smarter than us.
 Piling rules on is a leash; give them the foundation of a civilization and let
