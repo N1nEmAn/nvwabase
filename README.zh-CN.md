@@ -32,7 +32,7 @@
 
 **诚实的作用域声明**：本仓交付的是**历史支柱**——通用分层事实意图图谱、项目级钩子、子代理派发。造人与语言能力的完整编排实现在 [sapper-v2](https://github.com/N1nEmAn/sapper-v2) 的战场层。路线图将把两者抽取为通用运行时（见文末）。
 
-历史分三层：**标题 / 摘要 / 证据文档**——看标题知概况、按需下钻，像人查图书馆档案；知识外置后，**个体（AI 会话）死了，图还在**，继任者读图无缝接岗。意图图思想来自 [淚笑的 Cairn](https://github.com/oritera/Cairn)，致谢。
+历史分三层：**标题 / 摘要 / 证据文档**——看标题知概况、按需下钻，像人查图书馆档案；知识外置后，**个体（AI 会话）死了，图还在**，继任者读图无缝接岗。感谢 [淚笑的 Cairn](https://github.com/oritera/Cairn)——需要给 AI 记录历史的时候，参考了他们的思路，很受启发。
 
 **为什么不给 AI 更多规则？** 大模型已经比人聪明得多。堆规则是束缚；给它文明的地基，让它自己长出分工与制度，才能发挥最大潜力——sapper 战场里自己长出的通信兵、绩效考核与教训传承（见 sapper-v2 README"涌现"一节）就是证据。
 
@@ -85,7 +85,7 @@ Claude Code 用户：钩子会在每轮注入图状态，事实与意图随对�
 
 ## 致谢与作者
 
-意图图思想来自 [淚笑的 Cairn](https://github.com/oritera/Cairn)。
+感谢 [淚笑的 Cairn](https://github.com/oritera/Cairn)——需要给 AI 记录历史的时候，参考了他们的思路，很受启发。
 
 <p align="center"><img src="docs/assets/ape-stargazing.jpg" alt="AI 猿人第一次仰望星空" width="420"></p>
 

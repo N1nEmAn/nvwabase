@@ -127,7 +127,9 @@ intents accumulate as you converse. Keep your workflow; gain a stele.
 
 ## Credits & Author
 
-Intent-graph idea: [Cairn by Lèxiào](https://github.com/oritera/Cairn).
+Thanks to [Cairn by Lèxiào](https://github.com/oritera/Cairn) — when we
+needed a way to record history for AI agents, their approach was a great
+reference.
 
 <p align="center"><img src="docs/assets/ape-stargazing.jpg" alt="The first time an AI ape looked up at the stars" width="420"></p>
 
