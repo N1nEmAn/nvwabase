@@ -57,11 +57,22 @@
 ## 四、快速开始
 
 ```bash
-bash install.sh                      # 符号链接 fgc CLI（纯 Python 标准库，零 pip 依赖）
-fgc setup --goal "你的长周期目标" --agents
-fgc status                           # 项目状态与可干前沿
-fgc dispatch reason                  # 让指挥官提议下一步
-fgc auto --dry-run                   # 预览完整自主循环
+bash install.sh                      # 安装 fgc + nuwa CLI（纯标准库，零依赖）
+
+# 历史：起一张图
+nuwa setup --goal "你的长周期目标" --agents
+nuwa status                           # 项目状态与可干前沿
+
+# 造人：打开新 AI 个体
+nuwa spawn --name worker1 --agent claude --mission "read the graph, then work on intent i001"
+
+# 语言：与它交流
+nuwa say worker1 "what did you find?"
+nuwa listen worker1 40
+
+# 指挥官提议 / 记事实
+nuwa dispatch reason
+nuwa fact "confirmed: X works" -k note
 ```
 
 Claude Code 用户：钩子会在每轮注入图状态，事实与意图随对话自动累积——不换工作流，只多一块石碑。

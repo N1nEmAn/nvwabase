@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# nuwa — the Nüwa Foundation CLI: Create + Language + History for any agent swarm.
+#
+# Three capabilities, one command:
+#   Create   nuwa spawn [--name w1] [--agent claude] [--mission "..."]
+#   Language nuwa say <name> "<text>"     — send to an agent
+#            nuwa listen <name> [lines]   — read from an agent
+#   History  nuwa fact / nuwa intent / nuwa status / nuwa graph / nuwa recall ...
+#            (delegated to the fgc fact-intent graph, same shared memory)
+#
+# The substrate is tmux: one pane per agent, send-keys -l for reliable text
+# injection, capture-pane for reading. Any interactive CLI agent works —
+# claude, codex, gemini, or your own script.
+#
+# Usage:
+#   nuwa spawn --name worker1 --mission "read the graph, then explore intent i001"
+#   nuwa say worker1 "what did you find?"
+#   nuwa listen worker1 40
+#   nuwa list
+#   nuwa board
+#   nuwa kill worker1
+#
+# Graph commands are identical to `fgc` (same CLI, same store):
+#   nuwa fact "confirmed observation" -k note
+#   nuwa intent --from f001 "next step"
+#   nuwa status
+#   nuwa dispatch reason
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+FGC="${FGC_BIN:-fgc}"
+SESSION="${NUWA_SESSION:-nuwa}"
+ROOT="${NUWA_ROOT:-$PWD/.nuwa}"
+MAX_WORKERS="${NUWA_MAX_WORKERS:-8}"
+mkdir -p "$ROOT"
+
+log() { printf '[nuwa] %s\n' "$*" >&2; }
+die() { printf '[nuwa] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ─── tmux primitives (same rules as sapper: send-keys -l only, never paste) ──
+pane_text()   { tmux capture-pane -pt "$SESSION:$1" 2>/dev/null; }
+
+send_literal() {
+  local name="$1" text="$2"
+  tmux send-keys -t "$SESSION:$name" -l -- "$text"
+  sleep 0.3
+  tmux send-keys -t "$SESSION:$name" Enter
+}
+
+accept_dialogs() {
+  local name="$1" pane="$2"
+  if printf '%s' "$pane" | grep -qE 'Enter to confirm|Yes, I accept|I accept'; then
+    if printf '%s' "$pane" | grep -qE '❯[^\n]*No, exit'; then
+      tmux send-keys -t "$SESSION:$name" Down; sleep 0.3
+    fi
+    tmux send-keys -t "$SESSION:$name" Enter; sleep 1
+    return 0
+  fi
+  return 1
+}
+
+wait_input_box() {
+  local name="$1" waited=0 pane=""
+  while (( waited < 60 )); do
+    pane=$(pane_text "$name")
+    accept_dialogs "$name" "$pane" && { waited=$((waited+2)); continue; }
+    printf '%s' "$pane" | grep -q '❯' && return 0
+    sleep 1; waited=$((waited+1))
+  done
+  return 1
+}
+
+# ─── Create: spawn a new AI agent ────────────────────────────────────────────
+cmd_spawn() {
+  local name="" agent="${NUWA_AGENT:-claude}" mission="" minutes="" a
+  while (( $# )); do
+    a=$1; shift
+    case "$a" in
+      --name)    name="$1"; shift ;;
+      --agent)   agent="$1"; shift ;;
+      --mission) mission="$1"; shift ;;
+      --minutes) minutes="$1"; shift ;;
+      -*) die "spawn: unknown option $a" ;;
+      *)  [[ -z "$name" ]] && name="$a" || die "spawn: unexpected argument $a" ;;
+    esac
+  done
+  [[ -n "$name" ]] || { local n=1; while tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "w$n"; do n=$((n+1)); done; name="w$n"; }
+  [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "spawn: name must be [A-Za-z0-9_-]"
+
+  # session + pane cap
+  tmux has-session -t "$SESSION" 2>/dev/null || tmux new-session -d -s "$SESSION"
+  local nw; nw=$(tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -vc '^nuwa$' || echo 0)
+  (( nw >= MAX_WORKERS )) && die "CAP: $nw/$MAX_WORKERS agents — nuwa kill one first"
+
+  # kill stale window if re-spawning same name
+  tmux kill-window -t "$SESSION:$name" 2>/dev/null
+
+  # launch the agent
+  tmux new-window -d -t "$SESSION" -n "$name" \
+    "$agent 2>&1; echo NUWA_PANE_EXITED; exec sleep infinity"
+  log "$name: spawned ($agent)"
+
+  # wait for input box, then send mission
+  if wait_input_box "$name"; then
+    if [[ -n "$mission" ]]; then
+      send_literal "$name" "$mission"
+      log "$name: mission sent"
+    fi
+  else
+    log "$name: input box never appeared (60s) — pane left for inspection"
+  fi
+  printf 'SPAWNED %s agent=%s\n' "$name" "$agent"
+}
+
+# ─── Language: say / listen ─────────────────────────────────────────────────
+cmd_say() {
+  local name="${1:-}" text="${2:-}"
+  [[ -n "$name" && -n "$text" ]] || die 'usage: nuwa say <name> "<text>"'
+  tmux has-session -t "$SESSION" 2>/dev/null || die "session '$SESSION' not running"
+  tmux list-windows -t "$SESSION" -F '#W' | grep -qx -- "$name" || die "no such agent '$name'"
+  send_literal "$name" "$text"
+  log "say -> $name: ${text:0:60}"
+}
+
+cmd_listen() {
+  local name="${1:-}" lines="${2:-40}"
+  [[ -n "$name" ]] || die 'usage: nuwa listen <name> [lines=40]'
+  tmux has-session -t "$SESSION" 2>/dev/null || die "session '$SESSION' not running"
+  tmux list-windows -t "$SESSION" -F '#W' | grep -qx -- "$name" || die "no such agent '$name'"
+  tmux capture-pane -p -t "$SESSION:$name" 2>/dev/null | tail -n "$lines"
+}
+
+# ─── Roster: list / kill ─────────────────────────────────────────────────────
+cmd_list() {
+  tmux has-session -t "$SESSION" 2>/dev/null || { echo "(no agents)"; return 0; }
+  tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | while read -r w; do
+    [[ "$w" == "$(basename "$0")" ]] && continue
+    local pane state="alive"
+    pane=$(pane_text "$w" 2>/dev/null)
+    printf '%s' "$pane" | grep -q 'NUWA_PANE_EXITED' && state="exited"
+    printf '%-12s %s\n' "$w" "$state"
+  done
+}
+
+cmd_kill() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die 'usage: nuwa kill <name>'
+  tmux kill-window -t "$SESSION:$name" 2>/dev/null && log "killed $name" || log "kill: $name already gone"
+}
+
+# ─── Board: combined agent + graph overview ─────────────────────────────────
+cmd_board() {
+  echo "═══ agents ═══"
+  cmd_list
+  echo
+  echo "═══ graph ═══"
+  "$FGC" status 2>/dev/null || echo "(no graph — run: fgc init --goal \"...\")"
+}
+
+# ─── main dispatch ───────────────────────────────────────────────────────────
+case "${1:-}" in
+  spawn)  shift; cmd_spawn "$@" ;;
+  say)    shift; cmd_say "$@" ;;
+  listen) shift; cmd_listen "$@" ;;
+  list)   shift; cmd_list "$@" ;;
+  kill)   shift; cmd_kill "$name" "$@" ;;
+  board)  shift; cmd_board "$@" ;;
+  help|-h|--help)
+    cat <<'USAGE'
+nuwa — the Nüwa Foundation CLI (Create + Language + History)
+
+Create:
+  spawn [--name NAME] [--agent CMD] [--mission "..."]    start a new AI agent
+                                                          --agent: any interactive CLI (default: claude)
+  kill <name>                                             stop an agent
+
+Language:
+  say <name> "<text>"                                     send text to an agent (Enter included)
+  listen <name> [lines=40]                                read an agent's recent output
+
+Roster:
+  list                                                    all live agents
+  board                                                   agents + graph state
+
+History (same as fgc — shared fact-intent graph):
+  fact / intent / status / graph / frontier / recall / dispatch / auto / ...
+  All fgc commands pass through transparently.
+
+Environment:
+  NUWA_SESSION   tmux session name (default: nuwa)
+  NUWA_AGENT     default agent command for spawn (default: claude)
+  NUWA_MAX_WORKERS  max concurrent agents (default: 8)
+USAGE
+    ;;
+  *)
+    # transparent delegation to fgc for all History commands
+    if command -v "$FGC" >/dev/null 2>&1; then
+      exec "$FGC" "$@"
+    elif [[ -x "$SCRIPT_DIR/lib/fg.py" ]]; then
+      exec python3 "$SCRIPT_DIR/lib/fg.py" "$@"
+    else
+      die "unknown command '${1:-}' and fgc not found"
+    fi
+    ;;
+esac
