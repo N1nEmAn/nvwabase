@@ -21,13 +21,15 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 GOAL_ID = "goal"
 DEFAULT_STORE = ".fg"
@@ -35,6 +37,7 @@ LOCK_NAME = ".lock"
 PEERS_FILE = "ai-peers.json"
 AI_CHANNEL_NAME = "ai-channel.txt"
 PEER_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_UNSET = object()
 
 # --------------------------------------------------------------------------- #
 # time
@@ -77,28 +80,41 @@ class Store:
 
     # -- init --
     def init(self, origin: str, goal: str) -> None:
-        if self.exists():
-            raise FGError(f"fact graph already exists at {self.root}")
-        for d in (self.root, self.facts_dir, self.intents_dir, self.hints_dir):
-            d.mkdir(parents=True, exist_ok=True)
-        project = {
-            "id": "proj",
-            "origin": origin.strip(),
-            "goal": goal.strip(),
-            "status": "active",
-            "created_at": now_iso(),
-            "counters": {"fact": 0, "intent": 0, "hint": 0, "run": 0},
-        }
-        atomic_write_json(self.project_file, project)
-        # the goal terminal fact
-        goal_fact = {
-            "id": GOAL_ID,
-            "description": goal.strip(),
-            "created_at": now_iso(),
-            "creator": "system",
-            "source_intent": None,
-        }
-        atomic_write_json(self.facts_dir / f"{GOAL_ID}.json", goal_fact)
+        goal = goal.strip()
+        if not goal:
+            raise FGError("goal cannot be empty")
+        # Serialize initialization too.  Without this lock two simultaneous
+        # `fgc init` processes can both pass the existence check and overwrite
+        # each other's project metadata and goal fact.
+        with self.locked():
+            if self.exists():
+                raise FGError(f"fact graph already exists at {self.root}")
+            leftovers = [p.name for p in self.root.iterdir() if p.name != LOCK_NAME]
+            if leftovers:
+                raise FGError(
+                    f"cannot initialize graph in non-empty directory {self.root}; "
+                    f"found: {', '.join(sorted(leftovers)[:5])}"
+                )
+            for d in (self.root, self.facts_dir, self.intents_dir, self.hints_dir):
+                d.mkdir(parents=True, exist_ok=True)
+            project = {
+                "id": "proj",
+                "origin": origin.strip(),
+                "goal": goal,
+                "status": "active",
+                "created_at": now_iso(),
+                "counters": {"fact": 0, "intent": 0, "hint": 0, "run": 0},
+            }
+            atomic_write_json(self.project_file, project)
+            # the goal terminal fact
+            goal_fact = {
+                "id": GOAL_ID,
+                "description": goal,
+                "created_at": now_iso(),
+                "creator": "system",
+                "source_intent": None,
+            }
+            atomic_write_json(self.facts_dir / f"{GOAL_ID}.json", goal_fact)
 
     # -- locking --
     @contextmanager
@@ -114,7 +130,29 @@ class Store:
 
     # -- project --
     def load_project(self) -> dict:
-        return read_json(self.project_file)
+        try:
+            project = read_json(self.project_file)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError, TypeError, ValueError) as exc:
+            raise FGError(f"cannot read project metadata {self.project_file}: {exc}") from exc
+        if not isinstance(project, dict):
+            raise FGError("invalid project.json: expected a JSON object")
+        for key in ("id", "origin", "goal", "status"):
+            if not isinstance(project.get(key), str):
+                raise FGError(f"invalid project.json: '{key}' must be a string")
+        if not project["goal"].strip():
+            raise FGError("invalid project.json: 'goal' cannot be empty")
+        counters = project.get("counters")
+        if counters is None:
+            counters = {}
+            project["counters"] = counters
+        if not isinstance(counters, dict):
+            raise FGError("invalid project.json: 'counters' must be an object")
+        for kind in ("fact", "intent", "hint", "run"):
+            value = counters.get(kind, 0)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise FGError(f"invalid project.json: counter {kind!r} must be a non-negative integer")
+            counters.setdefault(kind, value)
+        return project
 
     def save_project(self, project: dict) -> None:
         atomic_write_json(self.project_file, project)
@@ -123,6 +161,16 @@ class Store:
     def _next_id(self, kind: str, prefix: str) -> str:
         project = self.load_project()
         n = project["counters"].get(kind, 0) + 1
+        directory = {
+            "fact": self.facts_dir,
+            "intent": self.intents_dir,
+            "hint": self.hints_dir,
+        }.get(kind)
+        # Counters are metadata, not the source of truth.  If a user restores
+        # or hand-edits a graph with a stale counter, skip occupied ids instead
+        # of silently replacing an existing node.
+        while directory is not None and (directory / f"{prefix}{n:03d}.json").exists():
+            n += 1
         project["counters"][kind] = n
         self.save_project(project)
         return f"{prefix}{n:03d}"
@@ -132,14 +180,27 @@ class Store:
         return _read_node_files(self.facts_dir, "fact")
 
     def get_fact(self, fid: str) -> dict:
+        _validate_lookup_id(fid, "fact")
         p = self.facts_dir / f"{fid}.json"
         if not p.exists():
             raise FGError(f"fact {fid} not found")
-        return read_json(p)
+        return _read_node(p, "fact")
 
     def add_fact(self, description: str, creator: str, source_intent: str | None,
                  title: str | None = None, doc: str | None = None) -> dict:
+        if not isinstance(description, str) or not description.strip():
+            raise FGError("fact description cannot be empty")
+        if not isinstance(creator, str) or not creator.strip():
+            raise FGError("fact creator cannot be empty")
+        if source_intent is not None:
+            _validate_lookup_id(source_intent, "intent")
         with self.locked():
+            source = None
+            if source_intent is not None:
+                source = self.get_intent(source_intent)
+                if source["to"] is not None:
+                    raise FGError(f"intent {source_intent} already concluded")
+                _check_conclusion_permission(source, creator, allow_unconfirmed=False)
             fid = self._next_id("fact", "f")
             fact = {
                 "id": fid,
@@ -151,6 +212,12 @@ class Store:
                 "source_intent": source_intent,
             }
             atomic_write_json(self.facts_dir / f"{fid}.json", fact)
+            if source is not None:
+                source["to"] = fid
+                source["status"] = "done"
+                source["concluded_at"] = now_iso()
+                source["worker"] = creator or source.get("worker")
+                self.save_intent(source)
             return fact
 
     # -- intents --
@@ -158,20 +225,24 @@ class Store:
         return _read_node_files(self.intents_dir, "intent")
 
     def get_intent(self, iid: str) -> dict:
+        _validate_lookup_id(iid, "intent")
         p = self.intents_dir / f"{iid}.json"
         if not p.exists():
             raise FGError(f"intent {iid} not found")
-        return read_json(p)
+        return _read_node(p, "intent")
 
     def _validate_from(self, fact_ids: list[str]) -> None:
-        if not fact_ids:
+        if not isinstance(fact_ids, list) or not fact_ids:
             raise FGError("intent must have at least one `from` fact")
+        if any(not isinstance(fid, str) for fid in fact_ids):
+            raise FGError("intent `from` ids must be strings")
         existing = {f["id"] for f in self.list_facts()}
         for fid in fact_ids:
             if fid not in existing:
                 raise FGError(f"from fact {fid} does not exist")
             if fid == GOAL_ID:
                 raise FGError("`goal` cannot be used in `from`")
+            _validate_lookup_id(fid, "fact")
 
     def add_intent(
         self,
@@ -182,6 +253,15 @@ class Store:
         title: str | None = None,
         doc: str | None = None,
     ) -> dict:
+        if not isinstance(description, str) or not description.strip():
+            raise FGError("intent description cannot be empty")
+        if not isinstance(creator, str) or not creator.strip():
+            raise FGError("intent creator cannot be empty")
+        if not isinstance(from_ids, list) or any(not isinstance(fid, str) for fid in from_ids):
+            raise FGError("intent `from` ids must be a list of strings")
+        # A hyper-edge only needs each dependency once; de-duplicate model or
+        # API input before validation and persistence.
+        from_ids = list(dict.fromkeys(from_ids))
         with self.locked():
             self._validate_from(from_ids)
             iid = self._next_id("intent", "i")
@@ -204,19 +284,81 @@ class Store:
             return intent
 
     def save_intent(self, intent: dict) -> None:
+        _validate_lookup_id(intent.get("id"), "intent")
         atomic_write_json(self.intents_dir / f"{intent['id']}.json", intent)
 
-    def conclude_intent(self, iid: str, to_fact_id: str, worker: str | None) -> dict:
-        """Link an intent to a produced fact (or 'goal'). Idempotent-ish: errors if already done."""
+    def update_doc(self, node_id: str, doc: str | None, *, expected_doc=_UNSET) -> dict:
+        """Update a fact/intent document under the graph lock."""
+        _validate_lookup_id(node_id, "node")
+        with self.locked():
+            candidates = []
+            if node_id == GOAL_ID:
+                candidates.append(("fact", self.facts_dir / f"{node_id}.json"))
+            else:
+                candidates.extend([
+                    ("fact", self.facts_dir / f"{node_id}.json"),
+                    ("intent", self.intents_dir / f"{node_id}.json"),
+                ])
+            for kind, path in candidates:
+                if path.exists():
+                    node = _read_node(path, kind)
+                    if expected_doc is not _UNSET and node.get("doc") != expected_doc:
+                        raise FGError(
+                            f"{node_id} changed while the editor was open; "
+                            "re-read it and try again"
+                        )
+                    node["doc"] = doc.strip() if isinstance(doc, str) and doc.strip() else None
+                    atomic_write_json(path, node)
+                    return node
+        raise FGError(f"no fact or intent named {node_id}")
+
+    def conclude_intent(
+        self,
+        iid: str,
+        to_fact_id: str,
+        worker: str | None,
+        *,
+        allow_unconfirmed: bool = False,
+    ) -> dict:
+        """Link an intent to a produced fact (or 'goal').
+
+        Confirmation and ownership are enforced here as the final write-side
+        guard.  Callers cannot bypass a human approval gate merely by invoking
+        `fgc done` or a lower-level method.  `allow_unconfirmed` is reserved
+        for internal abandonment bookkeeping (for example brainstorm siblings)
+        and is never exposed as a CLI flag.
+        """
         with self.locked():
             intent = self.get_intent(iid)
             if intent["to"] is not None:
                 raise FGError(
                     f"intent {iid} already concluded (to={intent['to']})"
                 )
+            _check_conclusion_permission(intent, worker, allow_unconfirmed)
+            if to_fact_id != GOAL_ID:
+                _validate_lookup_id(to_fact_id, "fact")
+            else:
+                project = self.load_project()
+                if project.get("status") == "completed":
+                    raise FGError("project is already completed")
+                if project.get("status") != "active":
+                    raise FGError(f"project status {project.get('status')!r} cannot be completed")
+                if any(
+                    other.get("id") != iid and other.get("to") == GOAL_ID
+                    for other in self.list_intents()
+                ):
+                    raise FGError("project already has a completion edge")
             if to_fact_id != GOAL_ID:
                 # fact must exist
-                self.get_fact(to_fact_id)
+                target_fact = self.get_fact(to_fact_id)
+                source_intent = target_fact.get("source_intent")
+                if source_intent not in (None, iid):
+                    raise FGError(
+                        f"fact {to_fact_id} already belongs to intent {source_intent}"
+                    )
+                if source_intent is None:
+                    target_fact["source_intent"] = iid
+                    atomic_write_json(self.facts_dir / f"{to_fact_id}.json", target_fact)
             intent["to"] = to_fact_id
             intent["status"] = "complete" if to_fact_id == GOAL_ID else "done"
             intent["concluded_at"] = now_iso()
@@ -229,9 +371,51 @@ class Store:
                 self.save_project(project)
             return intent
 
+    def complete_project(self, from_ids: list[str], note: str, worker: str) -> dict:
+        """Create the terminal goal edge atomically with the project status."""
+        if not isinstance(note, str) or not note.strip():
+            raise FGError("completion note cannot be empty")
+        if not isinstance(worker, str) or not worker.strip():
+            raise FGError("completion worker cannot be empty")
+        with self.locked():
+            project = self.load_project()
+            if project.get("status") == "completed":
+                raise FGError("project is already completed")
+            if project.get("status") != "active":
+                raise FGError(f"project status {project.get('status')!r} cannot be completed")
+            existing_goal_edge = any(
+                i.get("to") == GOAL_ID for i in self.list_intents()
+            )
+            if existing_goal_edge:
+                raise FGError("project already has a completion edge")
+            self._validate_from(from_ids)
+            iid = self._next_id("intent", "i")
+            intent = {
+                "id": iid,
+                "title": None,
+                "from": list(dict.fromkeys(from_ids)),
+                "to": GOAL_ID,
+                "description": note.strip(),
+                "doc": None,
+                "creator": worker,
+                "status": "complete",
+                "worker": worker,
+                "requires_confirmation": False,
+                "confirmed_at": None,
+                "created_at": now_iso(),
+                "concluded_at": now_iso(),
+            }
+            atomic_write_json(self.intents_dir / f"{iid}.json", intent)
+            project["status"] = "completed"
+            project["completed_at"] = now_iso()
+            self.save_project(project)
+            return intent
+
     def conclude_with_new_fact(
         self, iid: str, description: str, worker: str, title: str | None = None,
         doc: str | None = None,
+        *,
+        allow_unconfirmed: bool = False,
     ) -> tuple[dict, dict]:
         """Atomically: re-check the intent is still open under lock, allocate a new
         fact id, write the fact, and link the intent to it — all in ONE locked
@@ -245,6 +429,9 @@ class Store:
                     f"intent {iid} already concluded (to={intent['to']}); "
                     f"dropping duplicate executor result"
                 )
+            _check_conclusion_permission(intent, worker, allow_unconfirmed=allow_unconfirmed)
+            if not isinstance(description, str) or not description.strip():
+                raise FGError("fact description cannot be empty")
             fid = self._next_id("fact", "f")
             fact = {
                 "id": fid,
@@ -268,6 +455,8 @@ class Store:
             intent = self.get_intent(iid)
             if intent["to"] is not None:
                 raise FGError(f"intent {iid} already concluded")
+            if intent.get("requires_confirmation") and not intent.get("confirmed_at"):
+                raise FGError(f"intent {iid} requires confirmation before it can be claimed")
             owner = intent.get("worker")
             if owner and owner != worker:
                 raise FGError(f"intent {iid} claimed by {owner}")
@@ -291,6 +480,8 @@ class Store:
     def confirm_intent(self, iid: str) -> dict:
         with self.locked():
             intent = self.get_intent(iid)
+            if intent["to"] is not None:
+                raise FGError(f"intent {iid} already concluded")
             if not intent["requires_confirmation"]:
                 raise FGError(f"intent {iid} does not require confirmation")
             if intent["confirmed_at"]:
@@ -304,6 +495,10 @@ class Store:
         return _read_node_files(self.hints_dir, "hint")
 
     def add_hint(self, content: str, creator: str) -> dict:
+        if not isinstance(content, str) or not content.strip():
+            raise FGError("hint content cannot be empty")
+        if not isinstance(creator, str) or not creator.strip():
+            raise FGError("hint creator cannot be empty")
         with self.locked():
             hid = self._next_id("hint", "h")
             hint = {
@@ -327,43 +522,186 @@ def read_json(path: Path) -> dict:
 _VALID_NODE_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,16}$")
 
 
+def _validate_lookup_id(node_id: str, kind: str) -> None:
+    """Reject path-like ids before they are interpolated into a filename.
+
+    Graph ids are generated internally, but `show`, `doc`, and dispatch accept
+    ids from the command line.  Validating at that boundary prevents `../` or
+    absolute-path lookups from escaping the selected graph directory.
+    """
+    if not isinstance(node_id, str):
+        raise FGError(f"invalid {kind} id")
+    if node_id == GOAL_ID and kind in ("fact", "node"):
+        return
+    if not _VALID_NODE_ID_RE.fullmatch(node_id):
+        raise FGError(f"invalid {kind} id {node_id!r}")
+
+
+def _read_node(path: Path, kind: str) -> dict:
+    """Read one node and turn corruption into a concise CLI error."""
+    try:
+        data = read_json(path)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError, TypeError, ValueError) as exc:
+        raise FGError(f"cannot read {kind} {path.name}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise FGError(f"invalid {kind} {path.name}: expected a JSON object")
+    errors = _node_schema_errors(data, kind)
+    if errors:
+        raise FGError(f"invalid {kind} {path.name}: {'; '.join(errors)}")
+    if path.stem != data["id"]:
+        raise FGError(
+            f"invalid {kind} {path.name}: filename does not match id {data['id']!r}"
+        )
+    return data
+
+
+def _node_schema_errors(data: object, kind: str) -> list[str]:
+    """Return schema errors for records used by renderers and graph logic."""
+    if not isinstance(data, dict):
+        return ["expected a JSON object"]
+    errors: list[str] = []
+    node_id = data.get("id")
+    if not isinstance(node_id, str):
+        errors.append("missing string 'id'")
+    elif node_id == GOAL_ID and kind != "fact":
+        errors.append("reserved 'id' is only valid for the goal fact")
+    elif node_id != GOAL_ID and not _VALID_NODE_ID_RE.fullmatch(node_id):
+        errors.append("invalid 'id'")
+    if kind == "fact":
+        if not isinstance(data.get("description"), str):
+            errors.append("missing string 'description'")
+        if not isinstance(data.get("created_at"), str):
+            errors.append("missing string 'created_at'")
+        if not isinstance(data.get("creator"), str):
+            errors.append("missing string 'creator'")
+        if "source_intent" in data and data["source_intent"] is not None and not isinstance(data["source_intent"], str):
+            errors.append("'source_intent' must be a string or null")
+        if "source_intent" not in data:
+            errors.append("missing 'source_intent'")
+        if "title" in data and data["title"] is not None and not isinstance(data["title"], str):
+            errors.append("'title' must be a string or null")
+        if "doc" in data and data["doc"] is not None and not isinstance(data["doc"], str):
+            errors.append("'doc' must be a string or null")
+    elif kind == "intent":
+        if not isinstance(data.get("from"), list) or not data.get("from") or not all(
+            isinstance(x, str) and x != GOAL_ID and _VALID_NODE_ID_RE.fullmatch(x)
+            for x in data.get("from", [])
+        ):
+            errors.append("'from' must be a list of strings")
+        if "to" not in data or (
+            data.get("to") is not None
+            and (
+                not isinstance(data.get("to"), str)
+                or (data.get("to") != GOAL_ID and not _VALID_NODE_ID_RE.fullmatch(data.get("to")))
+            )
+        ):
+            errors.append("'to' must be a string or null")
+        if not isinstance(data.get("description"), str):
+            errors.append("missing string 'description'")
+        if not isinstance(data.get("created_at"), str):
+            errors.append("missing string 'created_at'")
+        if not isinstance(data.get("status"), str):
+            errors.append("missing string 'status'")
+        elif data["status"] not in {"open", "claimed", "done", "complete"}:
+            errors.append("invalid 'status'")
+        if "worker" not in data or (data.get("worker") is not None and not isinstance(data.get("worker"), str)):
+            errors.append("'worker' must be a string or null")
+        if not isinstance(data.get("requires_confirmation"), bool):
+            errors.append("missing boolean 'requires_confirmation'")
+        if "confirmed_at" not in data or (data.get("confirmed_at") is not None and not isinstance(data.get("confirmed_at"), str)):
+            errors.append("'confirmed_at' must be a string or null")
+        status = data.get("status")
+        target = data.get("to")
+        if status in {"done", "complete"} and target is None:
+            errors.append("completed status requires a target")
+        if status in {"open", "claimed"} and target is not None:
+            errors.append("open/claimed status cannot have a target")
+        if status == "complete" and target != GOAL_ID:
+            errors.append("complete status must target goal")
+        if status == "done" and target == GOAL_ID:
+            errors.append("done status cannot target goal")
+        if "title" in data and data["title"] is not None and not isinstance(data["title"], str):
+            errors.append("'title' must be a string or null")
+        if "doc" in data and data["doc"] is not None and not isinstance(data["doc"], str):
+            errors.append("'doc' must be a string or null")
+    elif kind == "hint":
+        if not isinstance(data.get("content"), str):
+            errors.append("missing string 'content'")
+        if not isinstance(data.get("creator"), str):
+            errors.append("missing string 'creator'")
+        if not isinstance(data.get("created_at"), str):
+            errors.append("missing string 'created_at'")
+    return errors
+
+
+def _check_conclusion_permission(
+    intent: dict, worker: str | None, allow_unconfirmed: bool,
+) -> None:
+    if intent.get("requires_confirmation") and not intent.get("confirmed_at") and not allow_unconfirmed:
+        raise FGError(
+            f"intent {intent['id']} requires confirmation; run `fgc confirm {intent['id']}` first"
+        )
+    owner = intent.get("worker")
+    if owner and owner != worker:
+        raise FGError(f"intent {intent['id']} claimed by {owner}")
+
+
 def _read_node_files(directory: Path, kind: str) -> list[dict]:
     """List all node JSON files in `directory`, skipping any that are malformed
     or schema-broken with a stderr warning (review codex#8: a corrupt .fg/*.json
     must NOT crash status/graph/view — degrade and keep going)."""
     out: list[dict] = []
+    seen: set[str] = set()
     for p in sorted(directory.glob("*.json")):
         try:
             data = read_json(p)
-        except (json.JSONDecodeError, OSError) as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError) as exc:
             sys.stderr.write(
                 f"fgc: warning: skipping malformed {kind} file {p.name}: {exc}\n"
             )
             continue
-        if not isinstance(data, dict) or "id" not in data:
+        errors = _node_schema_errors(data, kind)
+        if errors:
             sys.stderr.write(
-                f"fgc: warning: skipping invalid {kind} file {p.name} "
-                f"(missing 'id')\n"
+                f"fgc: warning: skipping invalid {kind} file {p.name}: "
+                f"{'; '.join(errors)}\n"
             )
             continue
         nid = data["id"]
-        if nid != GOAL_ID and not _VALID_NODE_ID_RE.match(nid):
+        if p.stem != nid:
             sys.stderr.write(
-                f"fgc: warning: skipping {kind} file {p.name}: "
-                f"invalid id {nid!r} (must match [a-z][a-z0-9_-]{{0,16}})\n"
+                f"fgc: warning: skipping {kind} file {p.name}: filename does not match id {nid!r}\n"
             )
             continue
+        if nid in seen:
+            sys.stderr.write(
+                f"fgc: warning: skipping duplicate {kind} id {nid!r} from {p.name}\n"
+            )
+            continue
+        seen.add(nid)
         out.append(data)
     return out
 
 
 def atomic_write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=False)
-        fh.write("\n")
-    os.replace(tmp, path)
+    # A PID-only temporary name collides when two threads in one process write
+    # the same node.  Create the temporary file in the destination directory so
+    # `os.replace` stays atomic on the same filesystem, and clean it up if
+    # serialization or replacement fails.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=False)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]+")
@@ -376,6 +714,11 @@ def _scrub_inline(text: str) -> str:
     return _CONTROL_CHAR_RE.sub(" ", text) if text else ""
 
 
+def _prompt_inline(text: str) -> str:
+    """Make graph text safe to place inside markdown prompt fences."""
+    return _scrub_inline(text).replace("`", "'")
+
+
 # --------------------------------------------------------------------------- #
 # graph helpers
 # --------------------------------------------------------------------------- #
@@ -383,12 +726,18 @@ def is_open(intent: dict) -> bool:
     return intent["to"] is None
 
 
-def is_ready(intent: dict) -> bool:
-    """Open, deps satisfied (facts are immutable so existence == satisfied),
-    and either unconfirmed-flagged-but-confirmed, or not requiring confirmation."""
+def is_ready(intent: dict, fact_ids: set[str] | None = None) -> bool:
+    """Whether an intent can be worked safely.
+
+    ``fact_ids`` is optional for callers that only need the state/confirmation
+    check.  The frontier passes the current set so a manually deleted or
+    corrupted dependency cannot remain actionable.
+    """
     if not is_open(intent):
         return False
-    if intent["requires_confirmation"] and not intent["confirmed_at"]:
+    if fact_ids is not None and not set(intent.get("from", ())).issubset(fact_ids):
+        return False
+    if intent.get("requires_confirmation") and not intent.get("confirmed_at"):
         return False
     return True
 
@@ -412,9 +761,80 @@ def build_graph_view(store: Store) -> dict:
     }
 
 
+def validate_graph(store: Store) -> list[str]:
+    """Return integrity errors without mutating the graph.
+
+    Normal read commands deliberately skip malformed node files so a damaged
+    graph remains inspectable.  This explicit audit command gives operators a
+    complete, actionable report before they dispatch agents or commit `.fg/`.
+    """
+    errors: list[str] = []
+    try:
+        project = store.load_project()
+    except FGError as exc:
+        return [str(exc)]
+    if project.get("status") not in {"active", "completed"}:
+        errors.append(f"project status must be 'active' or 'completed', got {project.get('status')!r}")
+    counters = project.get("counters", {})
+    for kind in ("fact", "intent", "hint", "run"):
+        if kind not in counters:
+            errors.append(f"project counters missing {kind!r}")
+
+    by_kind: dict[str, dict[str, dict]] = {"fact": {}, "intent": {}, "hint": {}}
+    dirs = {"fact": store.facts_dir, "intent": store.intents_dir, "hint": store.hints_dir}
+    for kind, directory in dirs.items():
+        for path in sorted(directory.glob("*.json")):
+            try:
+                data = read_json(path)
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError, TypeError, ValueError) as exc:
+                errors.append(f"{kind} {path.name}: unreadable JSON ({exc})")
+                continue
+            schema = _node_schema_errors(data, kind)
+            if schema:
+                errors.append(f"{kind} {path.name}: {'; '.join(schema)}")
+                continue
+            node_id = data["id"]
+            if path.stem != node_id:
+                errors.append(f"{kind} {path.name}: filename does not match id {node_id!r}")
+            if node_id in by_kind[kind]:
+                errors.append(f"duplicate {kind} id {node_id!r}")
+            by_kind[kind][node_id] = data
+
+    facts = by_kind["fact"]
+    intents = by_kind["intent"]
+    if GOAL_ID not in facts:
+        errors.append("missing terminal goal fact")
+    elif facts[GOAL_ID].get("description") != project.get("goal"):
+        errors.append("goal fact description does not match project goal")
+    for iid, intent in intents.items():
+        for fid in intent["from"]:
+            if fid not in facts:
+                errors.append(f"intent {iid}: missing dependency fact {fid}")
+            elif fid == GOAL_ID:
+                errors.append(f"intent {iid}: goal cannot be a dependency")
+        target = intent["to"]
+        if target is not None and target != GOAL_ID and target not in facts:
+            errors.append(f"intent {iid}: target fact {target} does not exist")
+        elif target is not None and target != GOAL_ID and facts[target].get("source_intent") != iid:
+            errors.append(f"intent {iid}: target fact {target} does not name it as source intent")
+    for fid, fact in facts.items():
+        source = fact.get("source_intent")
+        if source is not None and source not in intents:
+            errors.append(f"fact {fid}: source intent {source} does not exist")
+        elif source is not None and intents[source].get("to") != fid:
+            errors.append(f"fact {fid}: source intent {source} does not point to this fact")
+    goal_intents = [i for i in intents.values() if i["to"] == GOAL_ID]
+    if project.get("status") == "completed" and not goal_intents:
+        errors.append("project is completed but no intent targets the goal")
+    if project.get("status") == "active" and goal_intents:
+        errors.append("project is active although an intent already targets the goal")
+    return errors
+
+
 def frontier(store: Store) -> list[dict]:
     intents = store.list_intents()
-    ready = [i for i in intents if is_ready(i)]
+    fact_ids = {f["id"] for f in store.list_facts()}
+    ready = [i for i in intents if is_ready(i, fact_ids)]
     # claimed intents first (someone's already on them but they're still in-flight),
     # then by creation order.
     ready.sort(key=lambda i: (i["status"] != "claimed", i["created_at"]))
@@ -428,14 +848,18 @@ def render_status(store: Store) -> str:
     g = build_graph_view(store)
     p = g["project"]
     lines = []
-    lines.append(f"project: {p.get('id')}  status: {p['status']}")
-    lines.append(f"origin: {p['origin']}")
-    lines.append(f"goal:   {p['goal']}")
+    lines.append(
+        f"project: {_scrub_inline(p.get('id') or '')}  "
+        f"status: {_scrub_inline(p['status'])}"
+    )
+    lines.append(f"origin: {_scrub_inline(p['origin'])}")
+    lines.append(f"goal:   {_scrub_inline(p['goal'])}")
     lines.append(
         f"counts: {len(g['facts'])} facts, {len(g['open_intents'])} open / "
         f"{len(g['done_intents'])} done intents, {len(g['hints'])} hints"
     )
     fr = frontier(store)
+    pool = []
     if fr:
         lines.append("")
         lines.append("frontier (ready to work):")
@@ -607,11 +1031,11 @@ def render_history_block(store: Store, *, max_facts: int = 8,
 
 def render_graph_text(store: Store) -> str:
     g = build_graph_view(store)
-    lines = [f"# graph  ({g['project']['status']})"]
+    lines = [f"# graph  ({_scrub_inline(g['project']['status'])})"]
     lines.append("")
     lines.append("## facts")
     for f in g["facts"]:
-        src = f"  <- {f['source_intent']}" if f.get("source_intent") else ""
+        src = f"  <- {_scrub_inline(f['source_intent'])}" if f.get("source_intent") else ""
         t = f"[{_scrub_inline(f['title'])}]  " if f.get("title") else ""
         doc = "  📄" if f.get("doc") else ""
         lines.append(f"  {f['id']}: {t}{_scrub_inline(f['description'])}{src}{doc}")
@@ -631,7 +1055,7 @@ def render_graph_text(store: Store) -> str:
         lines.append("")
         lines.append("## hints")
         for h in g["hints"]:
-            lines.append(f"  {h['id']} ({h['creator']}): {h['content']}")
+            lines.append(f"  {h['id']} ({_scrub_inline(h['creator'])}): {_scrub_inline(h['content'])}")
     return "\n".join(lines)
 
 
@@ -640,8 +1064,8 @@ def render_prompt(store: Store, template_text: str) -> str:
     g = build_graph_view(store)
     p = g["project"]
     replacements = {
-        "origin": p["origin"],
-        "goal": p["goal"],
+        "origin": _prompt_inline(p["origin"]),
+        "goal": _prompt_inline(p["goal"]),
         "graph_yaml": _to_yaml_like(g),
         "fact_ids": json.dumps(g["fact_ids"], ensure_ascii=False, indent=2),
         "open_intents": json.dumps(
@@ -653,10 +1077,7 @@ def render_prompt(store: Store, template_text: str) -> str:
         ),
         "max_intents": "3",
     }
-    out = template_text
-    for key, val in replacements.items():
-        out = out.replace("{" + key + "}", val)
-    return out
+    return _replace_placeholders(template_text, replacements)
 
 
 def render_intent_prompt(store: Store, template_text: str, intent: dict) -> str:
@@ -672,13 +1093,24 @@ def render_intent_prompt(store: Store, template_text: str, intent: dict) -> str:
     replacements = {
         "graph_yaml": _to_yaml_like(g),
         "intent_id": intent["id"],
-        "intent_description": intent["description"],
+        "intent_description": _prompt_inline(intent["description"]),
         "recall_block": recall_block,
     }
-    out = template_text
-    for key, val in replacements.items():
-        out = out.replace("{" + key + "}", val)
-    return out
+    return _replace_placeholders(template_text, replacements)
+
+
+def _replace_placeholders(template_text: str, replacements: dict[str, str]) -> str:
+    """Substitute template tokens in one pass.
+
+    Repeated ``str.replace`` calls re-scan inserted graph content, so a fact
+    containing text such as ``{goal}`` could accidentally rewrite a later
+    placeholder.  A regex pass only touches tokens present in the template.
+    """
+    return re.sub(
+        r"\{([A-Za-z_][A-Za-z0-9_]*)\}",
+        lambda match: replacements.get(match.group(1), match.group(0)),
+        template_text,
+    )
 
 
 def _intent_brief(i: dict) -> dict:
@@ -700,27 +1132,35 @@ def _to_yaml_like(g: dict) -> str:
     Shows title + description (the two summary layers) but NOT `doc` — the
     detailed layer is opt-in, read via `fgc doc <id>`, so prompts stay small."""
     lines = []
-    lines.append(f"project: status={g['project']['status']}")
-    lines.append(f"goal: {g['project']['goal']}")
+    lines.append(f"project: status={_prompt_inline(g['project']['status'])}")
+    lines.append(f"goal: {_prompt_inline(g['project']['goal'])}")
     lines.append("facts:")
     for f in g["facts"]:
-        src = f" (from {f['source_intent']})" if f.get("source_intent") else ""
-        title = f"[{f['title']}] " if f.get("title") else ""
+        src = f" (from {_prompt_inline(f['source_intent'])})" if f.get("source_intent") else ""
+        title = f"[{_prompt_inline(f['title'])}] " if f.get("title") else ""
         has_doc = " (has doc)" if f.get("doc") else ""
-        lines.append(f"  - {f['id']}: {title}{f['description']}{src}{has_doc}")
+        lines.append(
+            f"  - {f['id']}: {title}{_prompt_inline(f['description'])}{src}{has_doc}"
+        )
     lines.append("intents:")
     for i in g["intents"]:
         to = i["to"] or "open"
         flag = ""
         if i["requires_confirmation"] and not i["confirmed_at"]:
             flag = " [needs_confirmation]"
-        title = f"[{i['title']}] " if i.get("title") else ""
+        title = f"[{_prompt_inline(i['title'])}] " if i.get("title") else ""
         has_doc = " (has doc)" if i.get("doc") else ""
-        lines.append(f"  - {i['id']}: {i['from']} -> {to}{flag} | {title}{i['description']}{has_doc}")
+        lines.append(
+            f"  - {i['id']}: {i['from']} -> {to}{flag} | {title}"
+            f"{_prompt_inline(i['description'])}{has_doc}"
+        )
     if g["hints"]:
         lines.append("hints:")
         for h in g["hints"]:
-            lines.append(f"  - {h['id']} ({h['creator']}): {h['content']}")
+            lines.append(
+                f"  - {h['id']} ({_prompt_inline(h['creator'])}): "
+                f"{_prompt_inline(h['content'])}"
+            )
     lines.append(
         "note: nodes marked (has doc) carry a detailed layer — read it with "
         "`fgc doc <id>` when you need the full context."
@@ -801,6 +1241,10 @@ def run_claude(
     cwd: Path,
 ) -> dict:
     """Call `claude -p` and return the parsed JSON result envelope."""
+    if timeout < 1:
+        raise FGError("claude timeout must be at least 1 second")
+    if not isinstance(model, str) or not model.strip():
+        raise FGError("claude model cannot be empty")
     argv = [
         "claude", "-p",
         "--output-format", "json",
@@ -833,8 +1277,13 @@ def run_claude(
         raise FGError(
             f"claude did not return JSON. stdout[:300]={proc.stdout[:300]!r}"
         )
+    if not isinstance(envelope, dict):
+        raise FGError("claude returned a JSON value instead of an object envelope")
     if envelope.get("is_error"):
-        raise FGError(f"claude reported error: {envelope.get('result', '')[:300]}")
+        result = envelope.get("result", "")
+        raise FGError(f"claude reported error: {str(result)[:300]}")
+    if not isinstance(envelope.get("result", ""), str):
+        raise FGError("claude response envelope has a non-string result")
     return envelope
 
 
@@ -893,6 +1342,10 @@ def cmd_init(args) -> int:
     if args.force and store.root.exists():
         import shutil
         _assert_safe_store_root(store.root, "overwrite")
+        # `--force` is an explicit destructive operation.  Do not hold the
+        # graph's lock while deleting that lock file itself; another process
+        # waiting on the old inode would otherwise be detached from the new
+        # graph.  Normal (non-force) initialization is serialized in Store.init.
         shutil.rmtree(store.root)
     origin = args.origin or ""
     goal = args.goal
@@ -921,6 +1374,19 @@ def cmd_graph(args) -> int:
     return 0
 
 
+def cmd_validate(args) -> int:
+    store = Store(Path(args.store))
+    store.require()
+    errors = validate_graph(store)
+    if errors:
+        print(f"graph invalid: {len(errors)} error(s)")
+        for error in errors:
+            print(f"  - {error}")
+        return 1
+    print(f"graph valid: {store.root}")
+    return 0
+
+
 def cmd_frontier(args) -> int:
     store = Store(Path(args.store))
     store.require()
@@ -942,19 +1408,25 @@ def cmd_pick(args) -> int:
     store = Store(Path(args.store))
     store.require()
     fr = frontier(store)
+    worker = args.worker or _worker_id("agent") if args.claim else None
+    pool = []
     if fr:
-        pool = fr
-    elif args.any:
+        # `frontier` shows claimed work first for observability, but a worker
+        # asking to claim should skip another worker's lease and choose the
+        # next unclaimed item instead of failing on an unrelated lease.
+        pool = [
+            i for i in fr
+            if not args.claim or not i.get("worker") or i.get("worker") == worker
+        ]
+    if not pool and args.any:
         # escape hatch: include intents not yet ready (e.g. awaiting confirmation)
         pool = [i for i in store.list_intents() if is_open(i)]
-    else:
-        pool = []
     if not pool:
         print("(nothing ready; pass --any to include unconfirmed/blocked open intents)")
         return 0
     chosen = pool[0]
     if args.claim:
-        worker = args.worker or _worker_id("agent")
+        assert worker is not None
         chosen = store.claim_intent(chosen["id"], worker)
     print(chosen["id"])
     return 0
@@ -1029,18 +1501,18 @@ def cmd_doc(args) -> int:
     `--set-file <path>` writes it. Pass --edit to open $EDITOR."""
     store = Store(Path(args.store))
     store.require()
-    # resolve the node (fact or intent) into a dir+path
-    if (store.facts_dir / f"{args.id}.json").exists():
+    _validate_lookup_id(args.id, "node")
+    # Resolve the node (fact or intent) without ever accepting a path-like id.
+    if args.id == GOAL_ID or (store.facts_dir / f"{args.id}.json").exists():
         node = store.get_fact(args.id)
-        target_dir = store.facts_dir
     elif (store.intents_dir / f"{args.id}.json").exists():
         node = store.get_intent(args.id)
-        target_dir = store.intents_dir
     else:
         raise FGError(f"no fact or intent named {args.id}")
 
     # WRITE paths
     if args.set is not None or args.set_file or args.edit:
+        expected_doc = node.get("doc")
         if args.edit:
             new_doc = _edit_via_editor(node.get("doc") or "", title=f"{args.id} doc")
         elif args.set_file:
@@ -1048,8 +1520,7 @@ def cmd_doc(args) -> int:
         else:
             new_doc = args.set
         new_doc = new_doc.strip() if isinstance(new_doc, str) else None
-        node["doc"] = (new_doc or None)
-        atomic_write_json(target_dir / f"{args.id}.json", node)
+        node = store.update_doc(args.id, new_doc, expected_doc=expected_doc)
         print(f"updated doc for {args.id} ({len(node['doc'] or '')} chars)" if node["doc"]
               else f"cleared doc for {args.id}")
         return 0
@@ -1137,13 +1608,7 @@ def cmd_complete(args) -> int:
     store.require()
     from_ids = parse_from(args.from_)
     note = args.note or "goal satisfied"
-    intent = store.add_intent(
-        from_ids=from_ids,
-        description=note,
-        creator=args.worker,
-        requires_confirmation=False,
-    )
-    store.conclude_intent(intent["id"], GOAL_ID, args.worker)
+    intent = store.complete_project(from_ids, note, args.worker)
     print(f"project complete via {intent['id']} (goal)")
     return 0
 
@@ -1162,6 +1627,10 @@ def cmd_dispatch(args) -> int:
     store.require()
     model = args.model
     timeout = args.timeout
+    if not isinstance(model, str) or not model.strip():
+        raise FGError("--model cannot be empty")
+    if timeout < 1:
+        raise FGError("--timeout must be at least 1 second")
     skip = args.skip_permissions
     templates_dir = Path(args.templates)
 
@@ -1241,6 +1710,10 @@ def _dispatch_explore(store, templates_dir, intent, model, timeout, skip, cwd, a
         fact = store.get_fact(intent["to"])
         print(f"[explore] {intent['id']} already concluded -> {fact['id']}: {fact['description']}")
         return 0
+    if not args.dry_run and intent.get("requires_confirmation") and not intent.get("confirmed_at"):
+        raise FGError(
+            f"intent {intent['id']} requires confirmation; run `fgc confirm {intent['id']}` first"
+        )
     if not skip:
         # explore needs to actually do work (shell, edits); without skip-permissions
         # it will prompt the user for each tool use, which is usually not what
@@ -1282,10 +1755,10 @@ def _dispatch_verify(store, templates_dir, model, timeout, skip, cwd, args) -> i
         raise FGError(f"intent {args.intent} not concluded yet")
     fact = store.get_fact(intent["to"])
     tpl = _load_template(templates_dir, "verify.md")
-    prompt = (
-        tpl.replace("{intent_description}", intent["description"])
-        .replace("{result_description}", fact["description"])
-    )
+    prompt = _replace_placeholders(tpl, {
+        "intent_description": _scrub_inline(intent["description"]),
+        "result_description": _scrub_inline(fact["description"]),
+    })
     if args.dry_run:
         print(prompt)
         return 0
@@ -1298,7 +1771,9 @@ def _dispatch_verify(store, templates_dir, model, timeout, skip, cwd, args) -> i
     verified, issues = _parse_verify_payload(payload)
     tag = "VERIFIED" if verified else "FAILED"
     print(f"[verify] {args.intent}: {tag}" + (f" — {issues}" if issues else ""))
-    return 0
+    # A failed verification must be visible to shell scripts and CI callers;
+    # printing FAILED while returning success makes automation trust bad facts.
+    return 0 if verified else 1
 
 
 def _dispatch_blindspot(store, templates_dir, model, timeout, skip, cwd, args) -> int:
@@ -1321,6 +1796,8 @@ def _dispatch_blindspot(store, templates_dir, model, timeout, skip, cwd, args) -
 
 def _apply_blindspot(store: Store, payload: dict) -> str:
     """Parse blindspot output and record each as a hint."""
+    if not isinstance(payload, dict):
+        raise FGError("blindspot payload must be a JSON object")
     if payload.get("accepted") is False:
         return "blindspot analysis rejected"
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
@@ -1332,13 +1809,17 @@ def _apply_blindspot(store: Store, payload: dict) -> str:
     if not spots:
         return "no blindspots identified"
     recorded = []
-    for spot in spots:
+    for spot in spots[:7]:
         if not isinstance(spot, dict):
             continue
-        area = spot.get("area", "unknown")
-        risk = spot.get("risk", "medium")
-        question = spot.get("question", "")
-        suggestion = spot.get("suggestion", "")
+        area = str(spot.get("area", "unknown")).strip() or "unknown"
+        risk = str(spot.get("risk", "medium")).strip().lower() or "medium"
+        if risk not in {"high", "medium", "low"}:
+            risk = "medium"
+        question = str(spot.get("question", "")).strip()
+        suggestion = str(spot.get("suggestion", "")).strip()
+        if not question:
+            continue
         content = f"[blindspot/{risk}] {area}: {question}"
         if suggestion:
             content += f" — suggestion: {suggestion}"
@@ -1348,10 +1829,15 @@ def _apply_blindspot(store: Store, payload: dict) -> str:
 
 
 def _dispatch_brainstorm(store, templates_dir, model, timeout, skip, cwd, args) -> int:
+    if args.max_options < 1 or args.max_options > 20:
+        raise FGError("--max-options must be between 1 and 20")
     tpl = _load_template(templates_dir, "brainstorm.md")
-    prompt = render_prompt(store, tpl)
     max_options = str(getattr(args, "max_options", 4))
-    prompt = prompt.replace("{max_options}", max_options)
+    # Fill this template-only token before graph content is inserted.  A
+    # second pass over an already-rendered prompt would rewrite a fact that
+    # legitimately contains the literal text `{max_options}`.
+    tpl = tpl.replace("{max_options}", max_options)
+    prompt = render_prompt(store, tpl)
     if args.dry_run:
         print(prompt)
         return 0
@@ -1362,13 +1848,17 @@ def _dispatch_brainstorm(store, templates_dir, model, timeout, skip, cwd, args) 
     )
     text = envelope.get("result", "")
     payload = extract_json_object(text)
-    summary = _apply_brainstorm(store, payload)
+    summary = _apply_brainstorm(store, payload, max_options=args.max_options)
     print(f"[brainstorm] {summary}")
     return 0
 
 
-def _apply_brainstorm(store: Store, payload: dict) -> str:
+def _apply_brainstorm(store: Store, payload: dict, max_options: int | None = None) -> str:
     """Parse brainstorm output: create requires_confirmation intents for each option."""
+    if not isinstance(payload, dict):
+        raise FGError("brainstorm payload must be a JSON object")
+    if max_options is not None and (max_options < 1 or max_options > 20):
+        raise FGError("max_options must be between 1 and 20")
     if payload.get("accepted") is False:
         return "brainstorm rejected"
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
@@ -1379,25 +1869,39 @@ def _apply_brainstorm(store: Store, payload: dict) -> str:
         raise FGError("options must be a list")
     if not options:
         return "no options generated"
-    batch_tag = f"brainstorm-{now_iso()}"
+    # ISO timestamps only have second precision; two brainstorm calls in one
+    # second used to share a tag and picking one could abandon the other's
+    # options.  Add cryptographic entropy so batches are always disjoint.
+    batch_tag = f"brainstorm-{now_iso()}-{secrets.token_hex(6)}"
     existing_facts = {f["id"] for f in store.list_facts()}
     made = []
+    if max_options is not None:
+        options = options[:max_options]
     for opt in options:
         if not isinstance(opt, dict):
             continue
-        from_ids = [str(x) for x in opt.get("from", [])]
+        raw_from = opt.get("from", [])
+        if isinstance(raw_from, str):
+            raw_from = parse_from(raw_from)
+        if not isinstance(raw_from, list):
+            continue
+        from_ids = [str(x) for x in raw_from]
         if not from_ids:
             continue
         bad = [x for x in from_ids if x not in existing_facts or x == GOAL_ID]
         if bad:
             continue
-        desc = opt.get("description", "").strip()
+        raw_desc = opt.get("description", "")
+        desc = raw_desc.strip() if isinstance(raw_desc, str) else ""
         if not desc:
             continue
         title = opt.get("title")
         title = title.strip() if isinstance(title, str) and title.strip() else None
-        effort = opt.get("effort", "medium")
-        doc_text = opt.get("doc", "") or ""
+        effort = str(opt.get("effort", "medium")).strip().lower() or "medium"
+        if effort not in {"low", "medium", "high"}:
+            effort = "medium"
+        raw_doc = opt.get("doc", "")
+        doc_text = raw_doc.strip() if isinstance(raw_doc, str) else ""
         doc_text = f"[brainstorm batch: {batch_tag}]\n[effort: {effort}]\n\n{doc_text}".strip()
         intent = store.add_intent(
             from_ids=from_ids,
@@ -1442,13 +1946,13 @@ def cmd_brainstorm_pick(args) -> int:
             continue
         i_doc = i.get("doc") or ""
         if f"[brainstorm batch: {batch_tag}]" in i_doc:
-            fact = store.add_fact(
-                description=f"option abandoned in favor of {picked_id}",
-                creator="brainstorm-pick",
-                source_intent=None,
+            fact, _ = store.conclude_with_new_fact(
+                i["id"],
+                f"option abandoned in favor of {picked_id}",
+                "brainstorm-pick",
                 title="已弃用",
+                allow_unconfirmed=True,
             )
-            store.conclude_intent(i["id"], fact["id"], "brainstorm-pick")
             abandoned.append(i["id"])
     print(f"confirmed {picked_id}, abandoned {len(abandoned)} sibling(s): {', '.join(abandoned) or '(none)'}")
     return 0
@@ -1463,6 +1967,8 @@ def _load_template(templates_dir: Path, name: str) -> str:
 
 def _classify_reason_payload(payload: dict) -> tuple[str, dict | list | None]:
     """Mirror Star's reason contract: complete | intents | noop | rejected."""
+    if not isinstance(payload, dict):
+        raise FGError("reason payload must be a JSON object")
     if payload.get("accepted") is False:
         return "rejected", None
     data = payload.get("data") if isinstance(payload.get("data"), dict) else (
@@ -1495,27 +2001,37 @@ def _apply_reason(store: Store, kind: str, data) -> str:
         return "commander returned no new work (open intents already cover it)"
     if kind == "complete":
         comp = data
-        from_ids = [str(x) for x in comp["from"]]
+        raw_from = comp.get("from")
+        if not isinstance(raw_from, list):
+            raise FGError("complete.from must be a list of fact ids")
+        from_ids = [str(x) for x in raw_from]
         note = comp.get("description", "goal satisfied")
-        intent = store.add_intent(
-            from_ids=from_ids, description=note, creator="reason",
-        )
-        store.conclude_intent(intent["id"], GOAL_ID, "reason")
+        if not isinstance(note, str) or not note.strip():
+            raise FGError("complete.description must be a non-empty string")
+        intent = store.complete_project(from_ids, note, "reason")
         return f"goal complete via {intent['id']}"
     if kind == "intents":
-        # validate ALL from-facts exist before creating any intent, so one bad
-        # entry doesn't leave a half-applied batch (review M4).
+        # Validate each candidate before writing it. Invalid model entries are
+        # ignored without allowing a malformed id to reach the filesystem.
         existing = {f["id"] for f in store.list_facts()}
         made = []
-        for it in data:
-            from_ids = [str(x) for x in it.get("from", [])]
+        for it in data[:3]:
+            if not isinstance(it, dict):
+                continue
+            raw_from = it.get("from", [])
+            if isinstance(raw_from, str):
+                raw_from = parse_from(raw_from)
+            if not isinstance(raw_from, list):
+                continue
+            from_ids = [str(x) for x in raw_from]
             if not from_ids:
                 continue
             bad = [x for x in from_ids if x not in existing or x == GOAL_ID]
             if bad:
                 # skip invalid rather than aborting the whole batch
                 continue
-            desc = it.get("description", "").strip()
+            raw_desc = it.get("description", "")
+            desc = raw_desc.strip() if isinstance(raw_desc, str) else ""
             if not desc:
                 continue
             req = bool(it.get("requires_confirmation", False))
@@ -1561,6 +2077,8 @@ def _parse_explore_payload(payload: dict) -> tuple[str | None, str, str | None]:
 
 
 def _parse_verify_payload(payload: dict) -> tuple[bool, str]:
+    if not isinstance(payload, dict):
+        raise FGError("verify payload must be a JSON object")
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     if not isinstance(data, dict):
         raise FGError(f"invalid verify payload: {payload}")
@@ -1568,7 +2086,14 @@ def _parse_verify_payload(payload: dict) -> tuple[bool, str]:
     if not isinstance(verified, bool):
         raise FGError("verify payload missing boolean 'verified'")
     issues = data.get("issues", "") or ""
-    return verified, str(issues)
+    if not isinstance(issues, str):
+        raise FGError("verify payload 'issues' must be a string")
+    issues = issues.strip()
+    if not verified and not issues:
+        raise FGError("verify payload must explain a failed verification in 'issues'")
+    if verified and issues:
+        raise FGError("verify payload must leave 'issues' empty when verified")
+    return verified, issues
 
 
 # --------------------------------------------------------------------------- #
@@ -1581,6 +2106,21 @@ def _skill_root() -> Path:
 
 def _hook_script_path() -> Path:
     return _skill_root() / "lib" / "fg-hook.py"
+
+
+def _load_settings_patch():
+    """Load the settings patcher without importing it as a package."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_fg_settings_patch", _skill_root() / "lib" / "_settings_patch.py"
+        )
+        assert spec and spec.loader
+        patch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(patch)
+        return patch
+    except Exception as exc:
+        raise FGError(f"could not load settings patcher: {exc}") from exc
 
 
 def cmd_setup(args) -> int:
@@ -1597,6 +2137,16 @@ def cmd_setup(args) -> int:
     """
     project_dir = Path.cwd()
     store = Store(Path(args.store))
+    # Validate an existing settings file before creating a new graph.  A
+    # malformed Claude config should not leave setup half-completed with a
+    # graph that has no working hooks.
+    patch = _load_settings_patch()
+    target = patch.project_settings_path(project_dir)
+    if target.exists():
+        try:
+            patch.validate(target)
+        except (OSError, ValueError) as exc:
+            raise FGError(f"could not read {target}: {exc}") from exc
     made_graph = False
     if not store.exists():
         if not args.goal:
@@ -1612,17 +2162,9 @@ def cmd_setup(args) -> int:
 
     # register hooks into project-level settings
     try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "_fg_settings_patch", _skill_root() / "lib" / "_settings_patch.py"
-        )
-        assert spec and spec.loader
-        patch = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(patch)
-    except Exception as exc:
-        raise FGError(f"could not load settings patcher: {exc}")
-    target = patch.project_settings_path(project_dir)
-    changed, msgs = patch.add(target, str(_hook_script_path()))
+        changed, msgs = patch.add(target, str(_hook_script_path()))
+    except (OSError, ValueError) as exc:
+        raise FGError(f"could not update {target}: {exc}") from exc
     for m in msgs:
         print(m)
 
@@ -1632,7 +2174,9 @@ def cmd_setup(args) -> int:
         if ap.exists() and not args.force:
             print(f"AGENTS.md exists — leaving it (--force to overwrite)")
         else:
-            spec_txt = _AGENTS_SPEC.format(store=str(store.root.resolve()))
+            spec_txt = _AGENTS_SPEC.format(
+                store=str(store.root.resolve()), marker=_AGENTS_MARKER
+            )
             ap.write_text(spec_txt, encoding="utf-8")
             print(f"wrote {ap}")
 
@@ -1642,31 +2186,25 @@ def cmd_setup(args) -> int:
         "  fgc dispatch reason # propose next work\n"
         "  fgc peers --discover # optional: list tmux panes, then ask user who to authorize\n"
         "  fgc auto --skip-permissions  # drive to completion\n"
-        "To undo:  fgc teardown   (removes .claude/hooks + AGENTS.md; keeps .fg/)"
+        "To undo:  fgc teardown   (removes fgc hooks + its AGENTS.md; keeps .fg/)"
     )
     return 0
 
 
 def cmd_teardown(args) -> int:
-    """`fgc teardown` — remove the hooks/AGENTS.md from THIS project.
+    """`fgc teardown` — remove the hooks and fgc-owned AGENTS.md from THIS project.
 
     Never touches the graph data (.fg/) unless --purge is given.
     """
     project_dir = Path.cwd()
-    try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "_fg_settings_patch", _skill_root() / "lib" / "_settings_patch.py"
-        )
-        assert spec and spec.loader
-        patch = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(patch)
-    except Exception as exc:
-        raise FGError(f"could not load settings patcher: {exc}")
+    patch = _load_settings_patch()
     target = patch.project_settings_path(project_dir)
     removed_any = False
     if target.exists():
-        _, msgs = patch.remove(target, str(_hook_script_path()))
+        try:
+            _, msgs = patch.remove(target, str(_hook_script_path()))
+        except (OSError, ValueError) as exc:
+            raise FGError(f"could not update {target}: {exc}") from exc
         for m in msgs:
             print(m)
             if m.startswith("  -"):
@@ -1685,8 +2223,21 @@ def cmd_teardown(args) -> int:
 
     ap = project_dir / "AGENTS.md"
     if ap.exists():
-        ap.unlink()
-        print(f"removed {ap}")
+        try:
+            agents_text = ap.read_text(encoding="utf-8")
+        except OSError:
+            agents_text = ""
+        generated = (
+            agents_text.startswith(_AGENTS_MARKER)
+            or agents_text == _AGENTS_SPEC.format(
+                store=str(Path(args.store).resolve()), marker=_AGENTS_MARKER
+            )
+        )
+        if generated:
+            ap.unlink()
+            print(f"removed {ap}")
+        else:
+            print(f"kept existing {ap} (not generated by fgc)")
 
     if args.purge:
         import shutil
@@ -1723,7 +2274,18 @@ def _render_static_html(store: Store) -> str:
     """Inline the current graph into the HTML template as a snapshot."""
     tpl = _load_view_template()
     g = build_graph_view(store)
-    payload = json.dumps(g, ensure_ascii=False, indent=2)
+    # The JSON is embedded inside a <script>.  JSON escaping alone does not
+    # prevent a fact containing `</script>` from terminating that script before
+    # the browser parses it.  Escape HTML-significant characters while keeping
+    # Unicode readable in the generated report.
+    payload = (
+        json.dumps(g, ensure_ascii=False, indent=2)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
     # replace the INLINE placeholder: `null /*__END__*/`  ->  <json> /*__END__*/
     tpl = tpl.replace(
         "/*__GRAPH_JSON__*/ null /*__END__*/",
@@ -1881,6 +2443,12 @@ def cmd_auto(args) -> int:
     cwd = Path.cwd()
     max_steps = args.max_steps
     max_explore = args.max_explore
+    if timeout < 1:
+        raise FGError("--timeout must be at least 1 second")
+    if max_steps < 1:
+        raise FGError("--max-steps must be at least 1")
+    if max_explore < 1:
+        raise FGError("--max-explore must be at least 1")
     verify = args.verify
     dry = args.dry_run
 
@@ -1923,7 +2491,11 @@ def cmd_auto(args) -> int:
         noop_streak = 0
 
         # 2) explore each ready intent, up to the per-step cap
-        ready = frontier(store)
+        auto_worker = _worker_id(model)
+        ready = [
+            i for i in frontier(store)
+            if not i.get("worker") or i.get("worker") == auto_worker
+        ]
         if not ready:
             print(f"[auto] step {step}.2 no ready intents after reason")
             if _graph_signature(store) == before:
@@ -1954,11 +2526,25 @@ def cmd_auto(args) -> int:
                 if refreshed["to"] is not None:
                     print(f"[auto] step {step}.3 verify {iid}")
                     try:
-                        _run_verify_raw(
+                        verified, issues = _run_verify_raw(
                             store, templates_dir, refreshed, model, timeout, skip, cwd
                         )
+                        tag = "VERIFIED" if verified else "FAILED"
+                        print(f"[auto]        verify {iid} -> {tag}" + (f": {issues}" if issues else ""))
+                        if not verified:
+                            store.add_hint(
+                                content=(
+                                    f"verification failed for {iid}: "
+                                    f"{issues or 'the produced fact did not pass verification'}"
+                                ),
+                                creator="verify",
+                            )
                     except FGError as exc:
                         print(f"[auto] verify {iid} failed: {exc}")
+                        store.add_hint(
+                            content=f"verification could not complete for {iid}: {exc}",
+                            creator="verify",
+                        )
 
         if _graph_signature(store) == before:
             print(f"[auto] step {step}: no graph change after work — stopping")
@@ -1986,6 +2572,10 @@ def _run_reason_raw(store, templates_dir, model, timeout, skip, cwd) -> tuple[st
 def _run_explore_raw(store, templates_dir, intent, model, timeout, skip, cwd, claim=False) -> dict:
     if intent["to"] is not None:
         return store.get_fact(intent["to"])
+    if intent.get("requires_confirmation") and not intent.get("confirmed_at"):
+        raise FGError(
+            f"intent {intent['id']} requires confirmation; run `fgc confirm {intent['id']}` first"
+        )
     worker = _worker_id(model)
     tpl = _load_template(templates_dir, "explore.md")
     prompt = render_intent_prompt(store, tpl, intent)
@@ -2005,10 +2595,10 @@ def _run_explore_raw(store, templates_dir, intent, model, timeout, skip, cwd, cl
 def _run_verify_raw(store, templates_dir, intent, model, timeout, skip, cwd) -> tuple[bool, str]:
     fact = store.get_fact(intent["to"])
     tpl = _load_template(templates_dir, "verify.md")
-    prompt = (
-        tpl.replace("{intent_description}", intent["description"])
-        .replace("{result_description}", fact["description"])
-    )
+    prompt = _replace_placeholders(tpl, {
+        "intent_description": _scrub_inline(intent["description"]),
+        "result_description": _scrub_inline(fact["description"]),
+    })
     envelope = run_claude(
         prompt, model=model, timeout=timeout, skip_permissions=skip,
         append_system=None, cwd=cwd,
@@ -2047,14 +2637,26 @@ def _load_peers(store: Store) -> dict:
     path = _peers_path(store)
     if not path.exists():
         return _default_peers(store)
-    data = read_json(path)
+    try:
+        data = read_json(path)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError, TypeError, ValueError) as exc:
+        raise FGError(f"cannot read peers config {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise FGError(f"invalid peers config at {path}")
     data.setdefault("version", 1)
     data.setdefault("channel", str((store.root / AI_CHANNEL_NAME).resolve()))
     data.setdefault("peers", {})
+    if not isinstance(data["version"], int) or isinstance(data["version"], bool):
+        raise FGError(f"invalid peers config at {path}: version must be an integer")
+    if not isinstance(data["channel"], str) or not data["channel"].strip():
+        raise FGError(f"invalid peers config at {path}: channel must be a non-empty string")
     if not isinstance(data["peers"], dict):
         raise FGError(f"invalid peers config at {path}: peers must be an object")
+    for name, peer in data["peers"].items():
+        if not isinstance(name, str) or not PEER_NAME_RE.fullmatch(name):
+            raise FGError(f"invalid peers config at {path}: invalid peer name {name!r}")
+        if not isinstance(peer, dict) or not isinstance(peer.get("target"), str):
+            raise FGError(f"invalid peers config at {path}: peer {name!r} needs a target")
     return data
 
 
@@ -2295,7 +2897,10 @@ def cmd_capture(args) -> int:
     return 0
 
 
+_AGENTS_MARKER = "<!-- generated by fgc; edit or remove this marker to keep this file -->"
+
 _AGENTS_SPEC = """\
+{marker}
 # AGENTS.md — fact-graph protocol
 
 This project uses a fact-graph as shared working memory. The graph lives at
@@ -2315,6 +2920,7 @@ fgc frontier                   # only the ready open intents
 fgc show intent <id>           # full node detail
 fgc doc <id>                   # read the DETAILED document of a fact/intent (when you need depth)
 fgc fact "<gist>" -t "<title>" [--doc "<detail>"]   # record a confirmed result
+fgc fact "<gist>" --from-intent i003              # record + close i003 atomically
 fgc done <intent-id> --fact "<gist>" -t "<title>"   # finish an intent, produce a fact
 fgc hint "<message>"           # leave a note for the commander / human
 fgc peers --discover           # list tmux panes before asking the user to authorize peers
@@ -2370,6 +2976,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("graph", help="dump the graph")
     sp.add_argument("--format", choices=["text", "json"], default="text")
     sp.set_defaults(func=cmd_graph)
+
+    sp = sub.add_parser(
+        "validate",
+        help="audit graph JSON, references, and project status without changing files",
+    )
+    sp.set_defaults(func=cmd_validate)
 
     sp = sub.add_parser("frontier", help="open intents ready to work")
     sp.set_defaults(func=cmd_frontier)

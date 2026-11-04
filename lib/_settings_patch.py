@@ -31,6 +31,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 MARKER = "fg-hook.py"
@@ -66,12 +67,75 @@ def _load_settings(settings_path: Path) -> dict:
         return {}
     raw = settings_path.read_text(encoding="utf-8") or "{}"
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"{settings_path} is not valid JSON ({exc.msg} at line {exc.lineno}). "
             f"Fix it by hand before re-running fgc setup."
         )
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"{settings_path} is not valid UTF-8 ({exc}). "
+            f"Fix it by hand before re-running fgc setup."
+        )
+    if not isinstance(data, dict):
+        raise ValueError(f"{settings_path} must contain a JSON object at the top level")
+    return data
+
+
+def _event_groups(hooks: dict, event: str, *, create: bool) -> list[dict]:
+    """Load one event's hook groups while preserving a clear error boundary."""
+    if event not in hooks:
+        if not create:
+            return []
+        hooks[event] = []
+    groups = hooks[event]
+    if not isinstance(groups, list):
+        raise ValueError(f"settings hooks.{event} must be a list")
+    for idx, group in enumerate(groups):
+        if not isinstance(group, dict):
+            raise ValueError(f"settings hooks.{event}[{idx}] must be an object")
+        hook_list = group.get("hooks", [])
+        if not isinstance(hook_list, list):
+            raise ValueError(f"settings hooks.{event}[{idx}].hooks must be a list")
+        for hidx, hook in enumerate(hook_list):
+            if not isinstance(hook, dict):
+                raise ValueError(
+                    f"settings hooks.{event}[{idx}].hooks[{hidx}] must be an object"
+                )
+    return groups
+
+
+def _write_settings(settings_path: Path, data: dict) -> None:
+    """Atomically replace settings.json so an interrupted patch cannot leave
+    Claude Code with truncated JSON."""
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{settings_path.name}.", suffix=".tmp", dir=str(settings_path.parent)
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        if settings_path.exists():
+            shutil.copymode(settings_path, tmp)
+        os.replace(tmp, settings_path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def validate(settings_path: Path) -> dict:
+    """Parse and structurally validate a Claude settings file without editing."""
+    data = _load_settings(settings_path)
+    hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("settings 'hooks' must be an object")
+    for event, _arg in HOOK_EVENTS:
+        _event_groups(hooks, event, create=False)
+    return data
 
 
 def _has_hook(entries: list, marker: str) -> bool:
@@ -92,10 +156,12 @@ def add(settings_path: Path, hook_script: str) -> tuple[bool, list[str]]:
             shutil.copy2(settings_path, bak)
 
     hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("settings 'hooks' must be an object")
     changed = False
     msgs = []
     for event, arg in HOOK_EVENTS:
-        groups = hooks.setdefault(event, [])
+        groups = _event_groups(hooks, event, create=True)
         if _has_hook(groups, MARKER):
             msgs.append(f"  = {event}: already present")
             continue
@@ -107,9 +173,7 @@ def add(settings_path: Path, hook_script: str) -> tuple[bool, list[str]]:
         msgs.append(f"  + {event}: {arg}")
 
     if changed:
-        settings_path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-        )
+        _write_settings(settings_path, data)
         msgs.append(f"wrote {settings_path}")
     else:
         msgs.append(f"idempotent — nothing changed in {settings_path}")
@@ -120,15 +184,14 @@ def remove(settings_path: Path, hook_script: str = "") -> tuple[bool, list[str]]
     """Remove only our hook entries from settings_path."""
     if not settings_path.exists():
         return False, [f"no {settings_path} — nothing to remove"]
-    try:
-        data = _load_settings(settings_path)
-    except ValueError as exc:
-        return False, [str(exc)]
+    data = _load_settings(settings_path)
     hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("settings 'hooks' must be an object")
     changed = False
     msgs = []
     for event, _arg in HOOK_EVENTS:
-        groups = hooks.get(event, [])
+        groups = _event_groups(hooks, event, create=False)
         new_groups = []
         removed_here = False
         for group in groups:
@@ -152,9 +215,7 @@ def remove(settings_path: Path, hook_script: str = "") -> tuple[bool, list[str]]
                 del hooks[event]
         if not hooks:
             del data["hooks"]
-        settings_path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-        )
+        _write_settings(settings_path, data)
         msgs.append(f"wrote {settings_path}")
     else:
         msgs.append("no fact-graph hooks found to remove")
@@ -181,7 +242,11 @@ def main(argv: list[str]) -> int:
     else:
         target = user_settings_path()
     fn = add if argv[1] == "add" else remove
-    _, msgs = fn(target, hook_script)
+    try:
+        _, msgs = fn(target, hook_script)
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(f"_settings_patch: {exc}\n")
+        return 1
     for m in msgs:
         print(m)
     return 0

@@ -21,3 +21,5 @@ agents/
 .DS_Store
 .idea/
 .vscode/
+.claude/
+.omc/

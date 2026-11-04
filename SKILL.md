@@ -122,6 +122,7 @@ fgc init --goal "reproduce the empty-token crash"           # create .fg/
 fgc setup --goal "..." --agents                             # opt-in THIS project (hooks + graph)
 fgc status                                                  # project + frontier
 fgc graph [--format text|json]                               # full graph
+fgc validate                                                 # audit graph integrity (read-only)
 fgc frontier                                                # ready intents only
 fgc pick [--claim]                                          # next intent id
 fgc view [--serve]                                          # open the HTML visualization
@@ -130,8 +131,11 @@ fgc fact "<confirmed observation>" [--from-intent i003]     # add a fact
 fgc intent --from f001 "reproduce with empty token"         # add work
 fgc intent --from f001 "delete prod data" --confirm         # needs approval
 fgc done i003 --fact "crash reproduced: see out.log"        # conclude + record
+fgc fact "<confirmed result>" --from-intent i003             # link + conclude
 fgc complete --from f005 --note "root cause patched"        # finish project
 fgc confirm i007                                            # approve gated work
+fgc claim i003 --worker alice                                # reserve an intent
+fgc release i003 --worker alice                              # release your reservation
 fgc hint "check the middleware order"                       # message commander
 fgc peers --discover                                        # list tmux panes
 fgc peers --add harley --target api-6:0.0                   # authorize a peer
@@ -139,6 +143,12 @@ fgc send harley "status?"                                   # send + log message
 fgc capture harley --lines 120                              # read authorized peer output
 fgc teardown [--purge]                                      # opt-out THIS project
 ```
+
+Run `fgc validate` before autonomous dispatch or before committing graph data.
+It checks node schemas, fact dependencies, intent results, source links, and
+whether the project status agrees with a goal edge. A `--confirm` intent is
+write-protected until `fgc confirm <id>`; `--dry-run` remains available for
+reviewing its prompt without executing it.
 
 ### peers / send / capture — authorized tmux peer messaging
 

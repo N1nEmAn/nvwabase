@@ -75,12 +75,13 @@ authorized in this project's `.fg/ai-peers.json`.
   `fgc dispatch <intent-id> --skip-permissions` (executor does the work),
   `fgc dispatch verify --intent <id>` (verify a result), or
   `fgc auto --skip-permissions` (full loop to completion).
-- See state anytime: `fgc status`, `fgc graph`.
+- See state anytime: `fgc status`, `fgc graph`; run the read-only `fgc validate`
+  audit before autonomous dispatch or committing `.fg/`.
 
 ## Undo
 
 ```bash
-fgc teardown            # removes hooks + AGENTS.md from THIS project, keeps .fg/
+fgc teardown            # removes fgc hooks + its AGENTS.md, keeps .fg/
 fgc teardown --purge    # also deletes the graph data
 ```
 
