@@ -177,7 +177,7 @@ case "${1:-}" in
   say)    shift; cmd_say "$@" ;;
   listen) shift; cmd_listen "$@" ;;
   list)   shift; cmd_list "$@" ;;
-  kill)   shift; cmd_kill "$name" "$@" ;;
+  kill)   shift; cmd_kill "$@" ;;
   board)  shift; cmd_board "$@" ;;
   help|-h|--help)
     cat <<'USAGE'
