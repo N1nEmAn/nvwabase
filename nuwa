@@ -41,10 +41,24 @@ die() { printf '[nuwa] ERROR: %s\n' "$*" >&2; exit 1; }
 pane_text()   { tmux capture-pane -pt "$SESSION:$1" 2>/dev/null; }
 
 send_literal() {
-  local name="$1" text="$2"
+  # send text, then Enter — then VERIFY the input box is empty again; the CLI
+  # can swallow the first Enter while still rendering long pasted text, so a
+  # message would sit unsubmitted forever. Bounded re-Enter until the prompt
+  # line is blank (mission-confirmation, same lesson as sapper's worker.sh).
+  local name="$1" text="$2" i pane
   tmux send-keys -t "$SESSION:$name" -l -- "$text"
-  sleep 0.3
+  sleep 0.5
   tmux send-keys -t "$SESSION:$name" Enter
+  for i in 1 2 3 4; do
+    sleep 0.8
+    pane=$(tmux capture-pane -pt "$SESSION:$name" 2>/dev/null || true)
+    if printf '%s' "$pane" | tail -10 | grep -qE '^❯[[:space:]]*$'; then
+      return 0
+    fi
+    tmux send-keys -t "$SESSION:$name" Enter
+  done
+  log "$name: WARNING — input box not confirmed empty after send; message may be unsubmitted (inspect the pane)"
+  return 1
 }
 
 accept_dialogs() {
