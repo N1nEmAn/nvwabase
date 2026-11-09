@@ -94,22 +94,22 @@ Full command manual: [SKILL.md](SKILL.md).
 ## 4. Quick Start
 
 ```bash
-bash install.sh                      # installs fgc + nuwa CLI (stdlib only, zero deps)
+bash install.sh                      # installs fgc + nvwa CLI (stdlib only, zero deps)
 
 # History: start a graph
-nuwa setup --goal "your long-horizon goal" --agents
-nuwa status                           # project state & ready-to-work frontier
+nvwa setup --goal "your long-horizon goal" --agents
+nvwa status                           # project state & ready-to-work frontier
 
 # Create: open a new AI individual
-nuwa spawn --name worker1 --agent claude --mission "read the graph, then work on intent i001"
+nvwa spawn --name worker1 --agent claude --mission "read the graph, then work on intent i001"
 
 # Language: talk to it
-nuwa say worker1 "what did you find?"
-nuwa listen worker1 40
+nvwa say worker1 "what did you find?"
+nvwa listen worker1 40
 
 # Commander proposes / record facts
-nuwa dispatch reason
-nuwa fact "confirmed: X works" -k note
+nvwa dispatch reason
+nvwa fact "confirmed: X works" -k note
 ```
 
 Claude Code users: the hooks inject the graph into every turn — facts and
@@ -118,7 +118,7 @@ intents accumulate as you converse. Keep your workflow; gain a stele.
 ## 5. Roadmap
 
 - **General Create/Language runtime**: extract sapper's tmux spawning and
-  inter-agent channels into a generic `nuwa spawn / nuwa say` — so offices,
+  inter-agent channels into a generic `nvwa spawn / nvwa say` — so offices,
   research, and engineering can all grow civilizations on the full trio
 - **Accountability taggant**: co-build the open-source offensive-tool marking
   mechanism with the [sapper-v2](https://github.com/N1nEmAn/sapper-v2)

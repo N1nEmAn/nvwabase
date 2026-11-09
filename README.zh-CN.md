@@ -59,29 +59,29 @@
 ## 四、快速开始
 
 ```bash
-bash install.sh                      # 安装 fgc + nuwa CLI（纯标准库，零依赖）
+bash install.sh                      # 安装 fgc + nvwa CLI（纯标准库，零依赖）
 
 # 历史：起一张图
-nuwa setup --goal "你的长周期目标" --agents
-nuwa status                           # 项目状态与可干前沿
+nvwa setup --goal "你的长周期目标" --agents
+nvwa status                           # 项目状态与可干前沿
 
 # 造人：打开新 AI 个体
-nuwa spawn --name worker1 --agent claude --mission "read the graph, then work on intent i001"
+nvwa spawn --name worker1 --agent claude --mission "read the graph, then work on intent i001"
 
 # 语言：与它交流
-nuwa say worker1 "what did you find?"
-nuwa listen worker1 40
+nvwa say worker1 "what did you find?"
+nvwa listen worker1 40
 
 # 指挥官提议 / 记事实
-nuwa dispatch reason
-nuwa fact "confirmed: X works" -k note
+nvwa dispatch reason
+nvwa fact "confirmed: X works" -k note
 ```
 
 Claude Code 用户：钩子会在每轮注入图状态，事实与意图随对话自动累积——不换工作流，只多一块石碑。
 
 ## 五、路线图
 
-- **通用造人与语言运行时**：把 sapper 战场层的 tmux 造人 / 信道交流抽取为通用 `nuwa spawn / nuwa say`——任何场景（办公、研究、工程）都能在三能力齐备的地基上长出自己的文明
+- **通用造人与语言运行时**：把 sapper 战场层的 tmux 造人 / 信道交流抽取为通用 `nvwa spawn / nvwa say`——任何场景（办公、研究、工程）都能在三能力齐备的地基上长出自己的文明
 - **可追责示踪剂**：与 [sapper-v2](https://github.com/N1nEmAn/sapper-v2) 社区共建的开源攻防工具标记机制（见其 README 提案）
 - **你的场景**：女娲基座不限于渗透。在任何长周期协作工作上起一张图，看它长出什么——**接下来的仰望，由各位完成。**
 

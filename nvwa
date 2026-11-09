@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# nuwa — the Nüwa Foundation CLI: Create + Language + History for any agent swarm.
+# nvwa — the Nüwa Foundation CLI: Create + Language + History for any agent swarm.
 #
 # Three capabilities, one command:
-#   Create   nuwa spawn [--name w1] [--agent claude] [--mission "..."]
-#   Language nuwa say <name> "<text>"     — send to an agent
-#            nuwa listen <name> [lines]   — read from an agent
-#   History  nuwa fact / nuwa intent / nuwa status / nuwa graph / nuwa recall ...
+#   Create   nvwa spawn [--name w1] [--agent claude] [--mission "..."]
+#   Language nvwa say <name> "<text>"     — send to an agent
+#            nvwa listen <name> [lines]   — read from an agent
+#   History  nvwa fact / nvwa intent / nvwa status / nvwa graph / nvwa recall ...
 #            (delegated to the fgc fact-intent graph, same shared memory)
 #
 # The substrate is tmux: one pane per agent, send-keys -l for reliable text
@@ -13,29 +13,29 @@
 # claude, codex, gemini, or your own script.
 #
 # Usage:
-#   nuwa spawn --name worker1 --mission "read the graph, then explore intent i001"
-#   nuwa say worker1 "what did you find?"
-#   nuwa listen worker1 40
-#   nuwa list
-#   nuwa board
-#   nuwa kill worker1
+#   nvwa spawn --name worker1 --mission "read the graph, then explore intent i001"
+#   nvwa say worker1 "what did you find?"
+#   nvwa listen worker1 40
+#   nvwa list
+#   nvwa board
+#   nvwa kill worker1
 #
 # Graph commands are identical to `fgc` (same CLI, same store):
-#   nuwa fact "confirmed observation" -k note
-#   nuwa intent --from f001 "next step"
-#   nuwa status
-#   nuwa dispatch reason
+#   nvwa fact "confirmed observation" -k note
+#   nvwa intent --from f001 "next step"
+#   nvwa status
+#   nvwa dispatch reason
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 FGC="${FGC_BIN:-fgc}"
-SESSION="${NUWA_SESSION:-nuwa}"
-ROOT="${NUWA_ROOT:-$PWD/.nuwa}"
-MAX_WORKERS="${NUWA_MAX_WORKERS:-8}"
+SESSION="${NVWA_SESSION:-nvwa}"
+ROOT="${NVWA_ROOT:-$PWD/.nvwa}"
+MAX_WORKERS="${NVWA_MAX_WORKERS:-8}"
 mkdir -p "$ROOT"
 
-log() { printf '[nuwa] %s\n' "$*" >&2; }
-die() { printf '[nuwa] ERROR: %s\n' "$*" >&2; exit 1; }
+log() { printf '[nvwa] %s\n' "$*" >&2; }
+die() { printf '[nvwa] ERROR: %s\n' "$*" >&2; exit 1; }
 
 # ─── tmux primitives (same rules as sapper: send-keys -l only, never paste) ──
 pane_text()   { tmux capture-pane -pt "$SESSION:$1" 2>/dev/null; }
@@ -86,7 +86,7 @@ wait_input_box() {
 
 # ─── Create: spawn a new AI agent ────────────────────────────────────────────
 cmd_spawn() {
-  local name="" agent="${NUWA_AGENT:-claude}" mission="" minutes="" a
+  local name="" agent="${NVWA_AGENT:-claude}" mission="" minutes="" a
   while (( $# )); do
     a=$1; shift
     case "$a" in
@@ -103,15 +103,15 @@ cmd_spawn() {
 
   # session + pane cap
   tmux has-session -t "$SESSION" 2>/dev/null || tmux new-session -d -s "$SESSION"
-  local nw; nw=$(tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -vc '^nuwa$' || echo 0)
-  (( nw >= MAX_WORKERS )) && die "CAP: $nw/$MAX_WORKERS agents — nuwa kill one first"
+  local nw; nw=$(tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -vc '^nvwa$' || echo 0)
+  (( nw >= MAX_WORKERS )) && die "CAP: $nw/$MAX_WORKERS agents — nvwa kill one first"
 
   # kill stale window if re-spawning same name
   tmux kill-window -t "$SESSION:$name" 2>/dev/null
 
   # launch the agent
   tmux new-window -d -t "$SESSION" -n "$name" \
-    "$agent 2>&1; echo NUWA_PANE_EXITED; exec sleep infinity"
+    "$agent 2>&1; echo NVWA_PANE_EXITED; exec sleep infinity"
   log "$name: spawned ($agent)"
 
   # wait for input box, then send mission
@@ -129,7 +129,7 @@ cmd_spawn() {
 # ─── Language: say / listen ─────────────────────────────────────────────────
 cmd_say() {
   local name="${1:-}" text="${2:-}"
-  [[ -n "$name" && -n "$text" ]] || die 'usage: nuwa say <name> "<text>"'
+  [[ -n "$name" && -n "$text" ]] || die 'usage: nvwa say <name> "<text>"'
   tmux has-session -t "$SESSION" 2>/dev/null || die "session '$SESSION' not running"
   tmux list-windows -t "$SESSION" -F '#W' | grep -qx -- "$name" || die "no such agent '$name'"
   send_literal "$name" "$text"
@@ -138,7 +138,7 @@ cmd_say() {
 
 cmd_listen() {
   local name="${1:-}" lines="${2:-40}"
-  [[ -n "$name" ]] || die 'usage: nuwa listen <name> [lines=40]'
+  [[ -n "$name" ]] || die 'usage: nvwa listen <name> [lines=40]'
   tmux has-session -t "$SESSION" 2>/dev/null || die "session '$SESSION' not running"
   tmux list-windows -t "$SESSION" -F '#W' | grep -qx -- "$name" || die "no such agent '$name'"
   tmux capture-pane -p -t "$SESSION:$name" 2>/dev/null | tail -n "$lines"
@@ -151,14 +151,14 @@ cmd_list() {
     [[ "$w" == "$(basename "$0")" ]] && continue
     local pane state="alive"
     pane=$(pane_text "$w" 2>/dev/null)
-    printf '%s' "$pane" | grep -q 'NUWA_PANE_EXITED' && state="exited"
+    printf '%s' "$pane" | grep -q 'NVWA_PANE_EXITED' && state="exited"
     printf '%-12s %s\n' "$w" "$state"
   done
 }
 
 cmd_kill() {
   local name="${1:-}"
-  [[ -n "$name" ]] || die 'usage: nuwa kill <name>'
+  [[ -n "$name" ]] || die 'usage: nvwa kill <name>'
   tmux kill-window -t "$SESSION:$name" 2>/dev/null && log "killed $name" || log "kill: $name already gone"
 }
 
@@ -181,7 +181,7 @@ case "${1:-}" in
   board)  shift; cmd_board "$@" ;;
   help|-h|--help)
     cat <<'USAGE'
-nuwa — the Nüwa Foundation CLI (Create + Language + History)
+nvwa — the Nüwa Foundation CLI (Create + Language + History)
 
 Create:
   spawn [--name NAME] [--agent CMD] [--mission "..."]    start a new AI agent
@@ -201,9 +201,9 @@ History (same as fgc — shared fact-intent graph):
   All fgc commands pass through transparently.
 
 Environment:
-  NUWA_SESSION   tmux session name (default: nuwa)
-  NUWA_AGENT     default agent command for spawn (default: claude)
-  NUWA_MAX_WORKERS  max concurrent agents (default: 8)
+  NVWA_SESSION   tmux session name (default: nvwa)
+  NVWA_AGENT     default agent command for spawn (default: claude)
+  NVWA_MAX_WORKERS  max concurrent agents (default: 8)
 USAGE
     ;;
   *)
