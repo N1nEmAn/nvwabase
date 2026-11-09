@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — install the `fgc` CLI + the `fgc-setup` project skill.
+# install.sh — install the `fgc` + `nuwa` CLIs and the `fgc-setup` project skill.
 #
 # This installer does NOT touch ~/.claude/settings.json and does NOT register
 # any global hooks. The fact-graph is strictly per-project opt-in: you opt a
@@ -15,6 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${SCRIPT_DIR}/lib/fg.py"
+NUWA="${SCRIPT_DIR}/nuwa"
 mode="${1:-install}"
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -24,8 +25,8 @@ fi
 
 # --- uninstall -------------------------------------------------------------
 if [[ "$mode" == "--uninstall" ]]; then
-  rm -f "${HOME}/.local/bin/fgc"
-  echo "removed ~/.local/bin/fgc"
+  rm -f "${HOME}/.local/bin/fgc" "${HOME}/.local/bin/nuwa"
+  echo "removed ~/.local/bin/fgc, ~/.local/bin/nuwa"
   if [[ -e "${HOME}/.claude/skills/fgc-setup" || -L "${HOME}/.claude/skills/fgc-setup" ]]; then
     rm -f "${HOME}/.claude/skills/fgc-setup"
     echo "removed ~/.claude/skills/fgc-setup"
@@ -49,6 +50,18 @@ fi
 ln -s "$SRC" "$DEST_DIR/fgc"
 chmod +x "$SRC"
 echo "installed: fgc -> $DEST_DIR/fgc"
+
+# --- install the nuwa CLI (Create + Language; History delegates to fgc) ----
+if [[ -f "$NUWA" ]]; then
+  if [[ -e "$DEST_DIR/nuwa" || -L "$DEST_DIR/nuwa" ]]; then
+    rm -f "$DEST_DIR/nuwa"
+  fi
+  ln -s "$NUWA" "$DEST_DIR/nuwa"
+  chmod +x "$NUWA"
+  echo "installed: nuwa -> $DEST_DIR/nuwa"
+else
+  echo "install: NOTE — no ./nuwa in this tree; installed fgc only (History pillar)." >&2
+fi
 
 case ":$PATH:" in
   *":$DEST_DIR:"*) ;;
