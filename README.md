@@ -115,6 +115,8 @@ nvwa fact "confirmed: X works" -k note
 Claude Code users: the hooks inject the graph into every turn — facts and
 intents accumulate as you converse. Keep your workflow; gain a stele.
 
+- **Grow your fruit**: [sapper-v2](https://github.com/N1nEmAn/sapper-v2) is the first fruit this tree has borne — an autonomous pentest legion. What the next fruit looks like is up to you: swap the doctrine, and sapper becomes sapper-for-your-domain.
+
 ## 5. Roadmap
 
 - **General Create/Language runtime**: extract sapper's tmux spawning and
