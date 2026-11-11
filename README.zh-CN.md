@@ -79,6 +79,8 @@ nvwa fact "confirmed: X works" -k note
 
 Claude Code 用户：钩子会在每轮注入图状态，事实与意图随对话自动累积——不换工作流，只多一块石碑。
 
+- **结你的果实**：[sapper-v2](https://github.com/N1nEmAn/sapper-v2) 是这棵树长出的第一颗果实——一支自主渗透军团。下一颗果实长什么样，由你决定：换掉军规，就是你的领域的 sapper。
+
 ## 五、路线图
 
 - **通用造人与语言运行时**：把 sapper 战场层的 tmux 造人 / 信道交流抽取为通用 `nvwa spawn / nvwa say`——任何场景（办公、研究、工程）都能在三能力齐备的地基上长出自己的文明
